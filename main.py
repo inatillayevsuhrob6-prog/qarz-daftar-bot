@@ -56,10 +56,6 @@ class PaymentCreate(BaseModel):
     note: Optional[str] = None
 
 
-class PinSet(BaseModel):
-    pin: Optional[str] = None
-
-
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""CREATE TABLE IF NOT EXISTS debtors (
@@ -71,8 +67,6 @@ async def init_db():
         await db.execute("""CREATE TABLE IF NOT EXISTS payments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,debtor_id INTEGER NOT NULL,amount REAL NOT NULL,
             note TEXT,payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS settings (
-            user_id INTEGER PRIMARY KEY,pin_code TEXT,language TEXT DEFAULT 'uz',theme TEXT DEFAULT 'light')""")
         for col, typ in [("currency", "TEXT DEFAULT 'UZS'"), ("rating", "INTEGER DEFAULT 3"), ("image_path", "TEXT")]:
             try:
                 await db.execute(f"ALTER TABLE debtors ADD COLUMN {col} {typ}")
@@ -144,42 +138,6 @@ async def startup():
     await init_db()
     await get_currency_rates()
     logger.info("🚀 Server ishga tushdi")
-
-
-@app.get("/api/settings")
-async def get_settings(user: dict = Depends(get_current_user)):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT pin_code, language, theme FROM settings WHERE user_id=?", (user["telegram_id"],))
-        row = await cur.fetchone()
-        if not row:
-            return {"pin_set": False, "pin_code": None, "language": "uz", "theme": "light"}
-        pin_valid = bool(row[0] and len(str(row[0])) == 4 and str(row[0]).isdigit())
-        return {"pin_set": pin_valid, "pin_code": row[0] if pin_valid else None,
-                "language": row[1] or "uz", "theme": row[2] or "light"}
-
-
-@app.post("/api/settings/pin")
-async def set_pin(data: PinSet, user: dict = Depends(get_current_user)):
-    async with aiosqlite.connect(DB_PATH) as db:
-        if data.pin and len(str(data.pin)) == 4 and str(data.pin).isdigit():
-            await db.execute("INSERT OR REPLACE INTO settings (user_id, pin_code) VALUES (?, ?)",
-                             (user["telegram_id"], str(data.pin)))
-            await db.commit()
-            return {"ok": True, "pin_set": True}
-        else:
-            await db.execute("DELETE FROM settings WHERE user_id=?", (user["telegram_id"],))
-            await db.commit()
-            return {"ok": True, "pin_set": False}
-
-
-@app.post("/api/settings/pin/verify")
-async def verify_pin(data: PinSet, user: dict = Depends(get_current_user)):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT pin_code FROM settings WHERE user_id=?", (user["telegram_id"],))
-        row = await cur.fetchone()
-    if not row or not row[0]:
-        return {"ok": True, "valid": True, "no_pin": True}
-    return {"ok": True, "valid": str(data.pin) == str(row[0])}
 
 
 @app.get("/api/stats")
@@ -477,17 +435,6 @@ body::before{content:'';position:fixed;inset:-50%;background:radial-gradient(cir
 .lb{flex:1;padding:11px;border:2px solid rgba(0,0,0,.1);border-radius:12px;background:var(--card);cursor:pointer;font-weight:700;font-size:12px;color:var(--txt)}
 .lb.ac{background:linear-gradient(135deg,var(--pri),var(--acc));color:#fff;border-color:transparent}
 .rb{background:var(--card);border-radius:22px;padding:20px;box-shadow:var(--sh)}
-.pin-screen{position:fixed;inset:0;background:var(--bg);z-index:3000;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:30px}
-.pin-box{background:var(--card);padding:40px 30px;border-radius:28px;box-shadow:var(--sh);text-align:center;width:100%;max-width:340px}
-.pin-title{font-size:22px;font-weight:900;margin-bottom:8px;background:linear-gradient(135deg,var(--pri),var(--acc));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.pin-sub{color:var(--mut);font-size:13px;margin-bottom:24px}
-.pin-dots{display:flex;gap:14px;justify-content:center;margin-bottom:28px}
-.pin-dot{width:16px;height:16px;border-radius:50%;background:rgba(0,0,0,.1);transition:.2s}
-.pin-dot.filled{background:var(--pri);transform:scale(1.2)}
-.pin-pad{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
-.pin-key{padding:18px;border:none;border-radius:16px;background:rgba(0,0,0,.04);font-size:22px;font-weight:700;cursor:pointer;color:var(--txt)}
-.pin-key:active{background:var(--pri);color:#fff}
-.pin-key.fn{background:transparent;font-size:16px}
 .pay-item{padding:12px;background:rgba(0,0,0,.03);border-radius:12px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}
 .cur-sel{display:flex;gap:6px;margin-bottom:14px}
 .cur-btn{flex:1;padding:10px;border:2px solid rgba(0,0,0,.1);border-radius:12px;background:var(--card);cursor:pointer;font-weight:700;font-size:13px;color:var(--txt)}
@@ -500,21 +447,7 @@ body::before{content:'';position:fixed;inset:-50%;background:radial-gradient(cir
 <canvas id="cc"></canvas>
 <div id="toast" class="toast">OK</div>
 
-<div id="pinScreen" class="pin-screen" style="display:none">
-<div class="pin-box">
-<div class="pin-title">🔐 PIN</div>
-<div class="pin-sub" id="pinSub">Kirish uchun PIN kiriting</div>
-<div class="pin-dots" id="pinDots"><div class="pin-dot"></div><div class="pin-dot"></div><div class="pin-dot"></div><div class="pin-dot"></div></div>
-<div class="pin-pad">
-<button class="pin-key" onclick="pinKey('1')">1</button><button class="pin-key" onclick="pinKey('2')">2</button><button class="pin-key" onclick="pinKey('3')">3</button>
-<button class="pin-key" onclick="pinKey('4')">4</button><button class="pin-key" onclick="pinKey('5')">5</button><button class="pin-key" onclick="pinKey('6')">6</button>
-<button class="pin-key" onclick="pinKey('7')">7</button><button class="pin-key" onclick="pinKey('8')">8</button><button class="pin-key" onclick="pinKey('9')">9</button>
-<button class="pin-key fn" onclick="pinClear()">C</button><button class="pin-key" onclick="pinKey('0')">0</button><button class="pin-key fn" onclick="pinDel()">⌫</button>
-</div>
-</div>
-</div>
-
-<div class="container" id="mainApp" style="display:none">
+<div class="container" id="mainApp">
 <div class="header">
 <div class="logo"><div class="logo-icon">💎</div><div class="logo-text"><h1 data-i18n="appTitle">Qarz Daftar</h1><p>Pro Edition</p></div></div>
 <div class="ha">
@@ -560,13 +493,6 @@ body::before{content:'';position:fixed;inset:-50%;background:radial-gradient(cir
 <div id="page-settings" class="page">
 <div class="st"><i class="fas fa-cog"></i><span data-i18n="settings">Sozlamalar</span></div>
 <div class="cc">
-<h3 style="margin-bottom:12px">🔐 PIN kod</h3>
-<p style="font-size:13px;color:var(--mut);margin-bottom:14px">Ilovani himoyalash uchun 4 xonali PIN</p>
-<div id="pinStatus" style="margin-bottom:12px;font-weight:700"></div>
-<button class="bs" onclick="changePin()">🔑 PIN o'rnatish / O'zgartirish</button>
-<button class="bs" style="background:linear-gradient(135deg,#ef4444,#dc2626);margin-top:8px" onclick="removePin()">🗑️ PIN o'chirish</button>
-</div>
-<div class="cc">
 <h3 style="margin-bottom:12px">💱 Valyuta kurslari</h3>
 <div id="ratesBox" style="font-size:14px"></div>
 <p style="font-size:11px;color:var(--mut);margin-top:10px">Kurslar har kuni avtomatik yangilanadi</p>
@@ -590,7 +516,7 @@ body::before{content:'';position:fixed;inset:-50%;background:radial-gradient(cir
 <div class="fg"><label class="fl" data-i18n="amount">Summa *</label><input type="number" class="fi" id="aam" placeholder="1000000"></div>
 </div>
 <div class="fg"><label class="fl" data-i18n="currency">Valyuta</label>
-<div class="cur-sel"><button class="cur-btn ac" onclick="selCur('UZS',this)">🇺🇿 UZS</button><button class="cur-btn" onclick="selCur('USD',this)">🇸 USD</button><button class="cur-btn" onclick="selCur('EUR',this)">🇪🇺 EUR</button></div>
+<div class="cur-sel"><button class="cur-btn ac" onclick="selCur('UZS',this)">🇺🇿 UZS</button><button class="cur-btn" onclick="selCur('USD',this)">🇸 USD</button><button class="cur-btn" onclick="selCur('EUR',this)">🇪 EUR</button></div>
 <input type="hidden" id="acur" value="UZS"></div>
 <div class="fr">
 <div class="fg"><label class="fl" data-i18n="dueDate">Muddat</label><input type="date" class="fi" id="adt"></div>
@@ -634,15 +560,15 @@ body::before{content:'';position:fixed;inset:-50%;background:radial-gradient(cir
 <script>
 const tg=window.Telegram?.WebApp;if(tg){tg.ready();tg.expand()}
 const H={'Content-Type':'application/json'};if(tg?.initData)H['X-Telegram-Init-Data']=tg.initData;
-let LANG=localStorage.getItem('lang')||'uz',RL='uz',pie=null,bar=null,pinBuf='',pinMode='check',selRating=3;
+let LANG=localStorage.getItem('lang')||'uz',RL='uz',pie=null,bar=null,selRating=3;
 
 let audioCtx=null;
 function initAudio(){if(!audioCtx){try{audioCtx=new(window.AudioContext||window.webkitAudioContext)()}catch(e){}}if(audioCtx&&audioCtx.state==='suspended'){audioCtx.resume()}return audioCtx}
 
 const T={
-uz:{appTitle:"Qarz Daftar",totalGiven:"Jami berilgan",remaining:"Qolgan",paid:"Tolangan",debtors:"Qarzdorlar",addDebtor:"Yangi qarzdor",debtorList:"Qarzdorlar",topDebtors:"TOP Qarzdorlar",statistics:"Statistika",reports:"Hisobotlar",downloadPdf:"PDF yuklab olish",settings:"Sozlamalar",navHome:"Bosh",newDebtor:"Yangi qarzdor",name:"Ism *",phone:"Telefon",amount:"Summa *",currency:"Valyuta",dueDate:"Muddat",category:"Kategoriya",note:"Izoh",save:"Saqlash",addPayment:"To'lov",confirm:"Tasdiqlash",pay:"To'lov",delete:"O'chirish",noDebtors:"Hali qarzdor yo'q",tapAbove:"Yuqoridagi tugmani bosing",debtorAdded:"Qo'shildi! ✨",paymentReceived:"Qabul qilindi! 💰🎉",deleted:"O'chirildi!",confirmDelete:"O'chirilsinmi?",nameAmountRequired:"Ism va summa majburiy!",invalidAmount:"Noto'g'ri summa",total:"Jami",paidAmount:"Tolangan",statusActive:"Faol",statusOverdue:"Muddati o'tgan",statusPaid:"To'langan",pinEnter:"PIN kiriting",pinSet:"Yangi PIN kiriting",pinConfirm:"PIN tasdiqlang",pinWrong:"Noto'g'ri PIN!",pinSaved:"PIN saqlandi",pinRemoved:"PIN o'chirildi",copied:"Nusxalandi!"},
-ru:{appTitle:"Долговая Книга",totalGiven:"Выдано",remaining:"Остаток",paid:"Оплачено",debtors:"Должники",addDebtor:"Новый должник",debtorList:"Должники",topDebtors:"ТОП Должники",statistics:"Статистика",reports:"Отчёты",downloadPdf:"Скачать PDF",settings:"Настройки",navHome:"Главная",newDebtor:"Новый должник",name:"Имя *",phone:"Телефон",amount:"Сумма *",currency:"Валюта",dueDate:"Срок",category:"Категория",note:"Примечание",save:"Сохранить",addPayment:"Платёж",confirm:"Подтвердить",pay:"Оплата",delete:"Удалить",noDebtors:"Нет должников",tapAbove:"Нажмите кнопку выше",debtorAdded:"Добавлен! ✨",paymentReceived:"Принят! 💰🎉",deleted:"Удалено!",confirmDelete:"Удалить?",nameAmountRequired:"Имя и сумма обязательны!",invalidAmount:"Неверная сумма",total:"Всего",paidAmount:"Оплачено",statusActive:"Активен",statusOverdue:"Просрочен",statusPaid:"Оплачен",pinEnter:"Введите PIN",pinSet:"Новый PIN",pinConfirm:"Подтвердите PIN",pinWrong:"Неверный PIN!",pinSaved:"PIN сохранён",pinRemoved:"PIN удалён",copied:"Скопировано!"},
-en:{appTitle:"Debt Book",totalGiven:"Total Given",remaining:"Remaining",paid:"Paid",debtors:"Debtors",addDebtor:"New Debtor",debtorList:"Debtors",topDebtors:"TOP Debtors",statistics:"Statistics",reports:"Reports",downloadPdf:"Download PDF",settings:"Settings",navHome:"Home",newDebtor:"New Debtor",name:"Name *",phone:"Phone",amount:"Amount *",currency:"Currency",dueDate:"Due Date",category:"Category",note:"Note",save:"Save",addPayment:"Payment",confirm:"Confirm",pay:"Pay",delete:"Delete",noDebtors:"No debtors yet",tapAbove:"Tap the button above",debtorAdded:"Added! ✨",paymentReceived:"Received! 💰🎉",deleted:"Deleted!",confirmDelete:"Delete?",nameAmountRequired:"Name and amount required!",invalidAmount:"Invalid amount",total:"Total",paidAmount:"Paid",statusActive:"Active",statusOverdue:"Overdue",statusPaid:"Paid",pinEnter:"Enter PIN",pinSet:"New PIN",pinConfirm:"Confirm PIN",pinWrong:"Wrong PIN!",pinSaved:"PIN saved",pinRemoved:"PIN removed",copied:"Copied!"}
+uz:{appTitle:"Qarz Daftar",totalGiven:"Jami berilgan",remaining:"Qolgan",paid:"Tolangan",debtors:"Qarzdorlar",addDebtor:"Yangi qarzdor",debtorList:"Qarzdorlar",topDebtors:"TOP Qarzdorlar",statistics:"Statistika",reports:"Hisobotlar",downloadPdf:"PDF yuklab olish",settings:"Sozlamalar",navHome:"Bosh",newDebtor:"Yangi qarzdor",name:"Ism *",phone:"Telefon",amount:"Summa *",currency:"Valyuta",dueDate:"Muddat",category:"Kategoriya",note:"Izoh",save:"Saqlash",addPayment:"To'lov",confirm:"Tasdiqlash",pay:"To'lov",delete:"O'chirish",noDebtors:"Hali qarzdor yo'q",tapAbove:"Yuqoridagi tugmani bosing",debtorAdded:"Qo'shildi! ✨",paymentReceived:"Qabul qilindi! 💰🎉",deleted:"O'chirildi!",confirmDelete:"O'chirilsinmi?",nameAmountRequired:"Ism va summa majburiy!",invalidAmount:"Noto'g'ri summa",total:"Jami",paidAmount:"Tolangan",statusActive:"Faol",statusOverdue:"Muddati o'tgan",statusPaid:"To'langan",copied:"Nusxalandi!"},
+ru:{appTitle:"Долговая Книга",totalGiven:"Выдано",remaining:"Остаток",paid:"Оплачено",debtors:"Должники",addDebtor:"Новый должник",debtorList:"Должники",topDebtors:"ТОП Должники",statistics:"Статистика",reports:"Отчёты",downloadPdf:"Скачать PDF",settings:"Настройки",navHome:"Главная",newDebtor:"Новый должник",name:"Имя *",phone:"Телефон",amount:"Сумма *",currency:"Валюта",dueDate:"Срок",category:"Категория",note:"Примечание",save:"Сохранить",addPayment:"Платёж",confirm:"Подтвердить",pay:"Оплата",delete:"Удалить",noDebtors:"Нет должников",tapAbove:"Нажмите кнопку выше",debtorAdded:"Добавлен! ✨",paymentReceived:"Принят! 💰🎉",deleted:"Удалено!",confirmDelete:"Удалить?",nameAmountRequired:"Имя и сумма обязательны!",invalidAmount:"Неверная сумма",total:"Всего",paidAmount:"Оплачено",statusActive:"Активен",statusOverdue:"Просрочен",statusPaid:"Оплачен",copied:"Скопировано!"},
+en:{appTitle:"Debt Book",totalGiven:"Total Given",remaining:"Remaining",paid:"Paid",debtors:"Debtors",addDebtor:"New Debtor",debtorList:"Debtors",topDebtors:"TOP Debtors",statistics:"Statistics",reports:"Reports",downloadPdf:"Download PDF",settings:"Settings",navHome:"Home",newDebtor:"New Debtor",name:"Name *",phone:"Phone",amount:"Amount *",currency:"Currency",dueDate:"Due Date",category:"Category",note:"Note",save:"Save",addPayment:"Payment",confirm:"Confirm",pay:"Pay",delete:"Delete",noDebtors:"No debtors yet",tapAbove:"Tap the button above",debtorAdded:"Added! ✨",paymentReceived:"Received! 💰🎉",deleted:"Deleted!",confirmDelete:"Delete?",nameAmountRequired:"Name and amount required!",invalidAmount:"Invalid amount",total:"Total",paidAmount:"Paid",statusActive:"Active",statusOverdue:"Overdue",statusPaid:"Paid",copied:"Copied!"}
 };
 function t(k){return T[LANG][k]||k}
 function ut(){document.querySelectorAll('[data-i18n]').forEach(e=>e.textContent=t(e.getAttribute('data-i18n')))}
@@ -659,73 +585,8 @@ function fm(a,c){c=c||'UZS';const s=new Intl.NumberFormat('uz-UZ').format(a||0);
 function toast(m,e){const t2=document.getElementById('toast');t2.textContent=m;t2.className='toast sh'+(e?' er':'');setTimeout(()=>t2.classList.remove('sh'),3000)}
 function toggleTheme(){snd2();const b=document.body,d=b.getAttribute('data-theme')==='dark';b.setAttribute('data-theme',d?'light':'dark');localStorage.setItem('theme',d?'light':'dark');document.getElementById('ti').className=d?'fas fa-moon':'fas fa-sun'}
 
-async function checkPin(){
-try{
-const s=await(await fetch('/api/settings',{headers:H})).json();
-if(s.pin_set&&s.pin_code){
-  document.getElementById('pinScreen').style.display='flex';
-  document.getElementById('mainApp').style.display='none';
-  pinMode='check';pinBuf='';
-  document.getElementById('pinSub').textContent=t('pinEnter');
-  updDots();
-}else{
-  document.getElementById('pinScreen').style.display='none';
-  document.getElementById('mainApp').style.display='block';
-  load();
-}
-}catch(e){
-  document.getElementById('pinScreen').style.display='none';
-  document.getElementById('mainApp').style.display='block';
-  load();
-}}
-
-function updDots(){document.querySelectorAll('.pin-dot').forEach((d,i)=>d.classList.toggle('filled',i<pinBuf.length))}
-function pinKey(k){initAudio();if(pinBuf.length>=4)return;pinBuf+=k;updDots();snd2();if(pinBuf.length===4)setTimeout(handlePin,300)}
-function pinDel(){pinBuf=pinBuf.slice(0,-1);updDots()}
-function pinClear(){pinBuf='';updDots()}
-
-let pinFirst='';
-async function handlePin(){
-if(pinMode==='check'){
-  try{
-    const r=await fetch('/api/settings/pin/verify',{method:'POST',headers:H,body:JSON.stringify({pin:pinBuf})});
-    const data=await r.json();
-    if(data.valid){
-      document.getElementById('pinScreen').style.display='none';
-      document.getElementById('mainApp').style.display='block';
-      load();
-    }else{
-      toast(t('pinWrong'),true);
-      pinBuf='';updDots();
-      document.querySelectorAll('.pin-dot').forEach(d=>{d.style.background='#ef4444';setTimeout(()=>d.style.background='',400)});
-    }
-  }catch(e){document.getElementById('pinScreen').style.display='none';document.getElementById('mainApp').style.display='block';load()}
-}else if(pinMode==='set'){
-  pinFirst=pinBuf;pinBuf='';
-  document.getElementById('pinSub').textContent=t('pinConfirm');
-  updDots();pinMode='confirm';
-}else if(pinMode==='confirm'){
-  if(pinBuf===pinFirst){
-    await fetch('/api/settings/pin',{method:'POST',headers:H,body:JSON.stringify({pin:pinFirst})});
-    toast('✅ '+t('pinSaved'));
-    document.getElementById('pinScreen').style.display='none';
-    document.getElementById('mainApp').style.display='block';
-    loadSettings();load();
-  }else{
-    toast(t('pinWrong'),true);
-    pinMode='set';pinBuf='';
-    document.getElementById('pinSub').textContent=t('pinSet');
-    updDots();
-  }
-}}
-
-function changePin(){snd2();document.getElementById('pinScreen').style.display='flex';document.getElementById('mainApp').style.display='none';pinMode='set';pinBuf='';pinFirst='';document.getElementById('pinSub').textContent=t('pinSet');updDots()}
-async function removePin(){snd2();await fetch('/api/settings/pin',{method:'POST',headers:H,body:JSON.stringify({pin:null})});toast('✅ '+t('pinRemoved'));loadSettings()}
-
 async function loadSettings(){
-try{const s=await(await fetch('/api/settings',{headers:H})).json();
-document.getElementById('pinStatus').innerHTML=s.pin_set?'✅ PIN o\\'rnatilgan (4 xona)':'❌ PIN yo\\'q';
-const st=await(await fetch('/api/stats',{headers:H})).json();
+try{const st=await(await fetch('/api/stats',{headers:H})).json();
 const r=st.rates||{};
 document.getElementById('ratesBox').innerHTML='💵 1 USD = '+(r.UZS?Math.round(r.UZS).toLocaleString():'—')+' UZS<br>💶 1 EUR = '+(r.UZS&&r.EUR?Math.round(r.UZS/r.EUR).toLocaleString():'—')+' UZS'}catch(e){}}
 
@@ -776,7 +637,7 @@ async function delD(id){if(!confirm(t('confirmDelete')))return;try{const r=await
 document.addEventListener('click',()=>initAudio(),{once:true});
 document.addEventListener('touchstart',()=>initAudio(),{once:true});
 
-window.onload=()=>{const th=localStorage.getItem('theme')||'light';document.body.setAttribute('data-theme',th);document.getElementById('ti').className=th==='dark'?'fas fa-sun':'fas fa-moon';ut();checkPin()};
+window.onload=()=>{const th=localStorage.getItem('theme')||'light';document.body.setAttribute('data-theme',th);document.getElementById('ti').className=th==='dark'?'fas fa-sun':'fas fa-moon';ut();load()};
 </script>
 </body></html>"""
 
@@ -789,7 +650,7 @@ async def index():
 @dp.message(CommandStart())
 async def cmd_start(m: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📒 Ilovani ochish", web_app=WebAppInfo(url=WEBAPP_URL))]])
-    await m.answer("<b>💎 Qarz Daftar Pro</b>\n\n🔐 PIN himoya\n📸 Rasm biriktirish\n🖨️ PDF hisobot (3 til)\n🏆 TOP qarzdorlar\n⭐ Ishonch reytingi\n🔔 Eslatma matni\n💱 Multi-valyuta\n💳 To'lovlar tarixi\n\nTugmani bosing 👇", reply_markup=kb)
+    await m.answer("<b>💎 Qarz Daftar Pro</b>\n\n📸 Rasm biriktirish\n🖨️ PDF hisobot (3 til)\n🏆 TOP qarzdorlar\n⭐ Ishonch reytingi\n🔔 Eslatma matni\n💱 Multi-valyuta\n💳 To'lovlar tarixi\n\nTugmani bosing 👇", reply_markup=kb)
 
 
 @dp.message(Command("report"))
