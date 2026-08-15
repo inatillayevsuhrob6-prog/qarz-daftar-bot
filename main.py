@@ -24,9 +24,8 @@ from aiogram.client.default import DefaultBotProperties
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
-# ============ KONFIGURATSIYA ============
 BOT_TOKEN = "8651436055:AAH3FgpFyhcnBo4RXXYQpLMv1Wk4qNiCXX0"
 WEBAPP_URL = "https://qarz-daftar-bot.onrender.com"
 DB_PATH = "qarz_daftar.db"
@@ -41,7 +40,6 @@ dp = Dispatcher()
 currency_cache = {"rates": {}, "updated": 0}
 
 
-# ============ MODELS ============
 class DebtorCreate(BaseModel):
     name: str
     phone: Optional[str] = None
@@ -62,45 +60,19 @@ class PinSet(BaseModel):
     pin: Optional[str] = None
 
 
-# ============ DATABASE ============
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS debtors (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                phone TEXT,
-                category TEXT DEFAULT 'Shaxsiy',
-                note TEXT,
-                total_amount REAL NOT NULL,
-                paid_amount REAL DEFAULT 0,
-                remaining_amount REAL NOT NULL,
-                currency TEXT DEFAULT 'UZS',
-                status TEXT DEFAULT 'ACTIVE',
-                rating INTEGER DEFAULT 3,
-                image_path TEXT,
-                due_date TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS payments (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                debtor_id INTEGER NOT NULL,
-                amount REAL NOT NULL,
-                note TEXT,
-                payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS settings (
-                user_id INTEGER PRIMARY KEY,
-                pin_code TEXT,
-                language TEXT DEFAULT 'uz',
-                theme TEXT DEFAULT 'light'
-            )
-        """)
+        await db.execute("""CREATE TABLE IF NOT EXISTS debtors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,name TEXT NOT NULL,
+            phone TEXT,category TEXT DEFAULT 'Shaxsiy',note TEXT,total_amount REAL NOT NULL,
+            paid_amount REAL DEFAULT 0,remaining_amount REAL NOT NULL,currency TEXT DEFAULT 'UZS',
+            status TEXT DEFAULT 'ACTIVE',rating INTEGER DEFAULT 3,image_path TEXT,due_date TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,debtor_id INTEGER NOT NULL,amount REAL NOT NULL,
+            note TEXT,payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS settings (
+            user_id INTEGER PRIMARY KEY,pin_code TEXT,language TEXT DEFAULT 'uz',theme TEXT DEFAULT 'light')""")
         for col, typ in [("currency", "TEXT DEFAULT 'UZS'"), ("rating", "INTEGER DEFAULT 3"), ("image_path", "TEXT")]:
             try:
                 await db.execute(f"ALTER TABLE debtors ADD COLUMN {col} {typ}")
@@ -110,7 +82,6 @@ async def init_db():
     logger.info("✅ Database tayyor")
 
 
-# ============ VALYUTA ============
 async def get_currency_rates():
     now = datetime.now().timestamp()
     if currency_cache["rates"] and now - currency_cache["updated"] < 86400:
@@ -120,11 +91,7 @@ async def get_currency_rates():
             r = await client.get("https://open.er-api.com/v6/latest/USD")
             data = r.json()
             rates = data.get("rates", {})
-            currency_cache["rates"] = {
-                "USD": 1.0,
-                "EUR": rates.get("EUR", 0.92),
-                "UZS": rates.get("UZS", 12500)
-            }
+            currency_cache["rates"] = {"USD": 1.0, "EUR": rates.get("EUR", 0.92), "UZS": rates.get("UZS", 12500)}
             currency_cache["updated"] = now
             logger.info("💱 Valyuta yangilandi")
     except Exception as e:
@@ -139,7 +106,6 @@ def convert_amount(amount, from_cur, to_cur, rates):
     return usd * rates.get(to_cur, 1)
 
 
-# ============ AUTH ============
 def verify_telegram_auth(init_data):
     if not init_data:
         raise HTTPException(401, "Auth yo'q")
@@ -169,7 +135,6 @@ async def get_current_user(request: Request):
     return verify_telegram_auth(init_data)
 
 
-# ============ FASTAPI ============
 app = FastAPI(title="Qarz Daftar Pro")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
@@ -181,7 +146,6 @@ async def startup():
     logger.info("🚀 Server ishga tushdi")
 
 
-# ============ SOZLAMALAR (PIN) ============
 @app.get("/api/settings")
 async def get_settings(user: dict = Depends(get_current_user)):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -189,21 +153,21 @@ async def get_settings(user: dict = Depends(get_current_user)):
         row = await cur.fetchone()
         if not row:
             return {"pin_set": False, "pin_code": None, "language": "uz", "theme": "light"}
-        return {"pin_set": bool(row[0] and len(row[0]) == 4), "pin_code": row[0] if row[0] and len(row[0]) == 4 else None,
+        pin_valid = bool(row[0] and len(str(row[0])) == 4 and str(row[0]).isdigit())
+        return {"pin_set": pin_valid, "pin_code": row[0] if pin_valid else None,
                 "language": row[1] or "uz", "theme": row[2] or "light"}
 
 
 @app.post("/api/settings/pin")
 async def set_pin(data: PinSet, user: dict = Depends(get_current_user)):
     async with aiosqlite.connect(DB_PATH) as db:
-        if data.pin and len(data.pin) == 4 and data.pin.isdigit():
+        if data.pin and len(str(data.pin)) == 4 and str(data.pin).isdigit():
             await db.execute("INSERT OR REPLACE INTO settings (user_id, pin_code) VALUES (?, ?)",
-                             (user["telegram_id"], data.pin))
+                             (user["telegram_id"], str(data.pin)))
             await db.commit()
             return {"ok": True, "pin_set": True}
         else:
-            await db.execute("INSERT OR REPLACE INTO settings (user_id, pin_code) VALUES (?, NULL)",
-                             (user["telegram_id"],))
+            await db.execute("DELETE FROM settings WHERE user_id=?", (user["telegram_id"],))
             await db.commit()
             return {"ok": True, "pin_set": False}
 
@@ -215,10 +179,9 @@ async def verify_pin(data: PinSet, user: dict = Depends(get_current_user)):
         row = await cur.fetchone()
     if not row or not row[0]:
         return {"ok": True, "valid": True, "no_pin": True}
-    return {"ok": True, "valid": data.pin == row[0]}
+    return {"ok": True, "valid": str(data.pin) == str(row[0])}
 
 
-# ============ STATISTIKA ============
 @app.get("/api/stats")
 async def get_stats(user: dict = Depends(get_current_user)):
     rates = await get_currency_rates()
@@ -262,20 +225,17 @@ async def top_debtors(user: dict = Depends(get_current_user)):
 async def get_payments(debtor_id: int, user: dict = Depends(get_current_user)):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cur = await db.execute("""
-            SELECT p.* FROM payments p JOIN debtors d ON p.debtor_id=d.id
-            WHERE p.debtor_id=? AND d.user_id=? ORDER BY p.payment_date DESC
-        """, (debtor_id, user["telegram_id"]))
+        cur = await db.execute("""SELECT p.* FROM payments p JOIN debtors d ON p.debtor_id=d.id
+            WHERE p.debtor_id=? AND d.user_id=? ORDER BY p.payment_date DESC""", (debtor_id, user["telegram_id"]))
         return [dict(r) for r in await cur.fetchall()]
 
 
 @app.post("/api/debtors")
 async def create_debtor(d: DebtorCreate, user: dict = Depends(get_current_user)):
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("""
-            INSERT INTO debtors (user_id,name,phone,category,note,total_amount,paid_amount,remaining_amount,currency,rating,due_date)
-            VALUES (?,?,?,?,?,?,0,?,?,?,?,?)
-        """, (user["telegram_id"], d.name, d.phone, d.category, d.note, d.amount, d.amount, d.currency, d.rating, d.due_date))
+        cur = await db.execute("""INSERT INTO debtors (user_id,name,phone,category,note,total_amount,paid_amount,remaining_amount,currency,rating,due_date)
+            VALUES (?,?,?,?,?,?,0,?,?,?,?,?)""",
+                               (user["telegram_id"], d.name, d.phone, d.category, d.note, d.amount, d.amount, d.currency, d.rating, d.due_date))
         await db.commit()
         return {"id": cur.lastrowid}
 
@@ -324,7 +284,6 @@ async def delete_debtor(debtor_id: int, user: dict = Depends(get_current_user)):
     return {"ok": True}
 
 
-# ============ RASM YUKLASH ============
 @app.post("/api/debtors/{debtor_id}/image")
 async def upload_image(debtor_id: int, file: UploadFile = File(...), user: dict = Depends(get_current_user)):
     ext = file.filename.split(".")[-1].lower() if file.filename else "jpg"
@@ -351,7 +310,6 @@ async def serve_image(filename: str):
     return Response(content, media_type=media_type)
 
 
-# ============ PDF ============
 @app.get("/api/export/pdf")
 async def export_pdf(user: dict = Depends(get_current_user), lang: str = "uz"):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -678,7 +636,6 @@ const tg=window.Telegram?.WebApp;if(tg){tg.ready();tg.expand()}
 const H={'Content-Type':'application/json'};if(tg?.initData)H['X-Telegram-Init-Data']=tg.initData;
 let LANG=localStorage.getItem('lang')||'uz',RL='uz',pie=null,bar=null,pinBuf='',pinMode='check',selRating=3;
 
-// ===== GLOBAL AUDIO CONTEXT (mobile fix) =====
 let audioCtx=null;
 function initAudio(){if(!audioCtx){try{audioCtx=new(window.AudioContext||window.webkitAudioContext)()}catch(e){}}if(audioCtx&&audioCtx.state==='suspended'){audioCtx.resume()}return audioCtx}
 
@@ -702,7 +659,6 @@ function fm(a,c){c=c||'UZS';const s=new Intl.NumberFormat('uz-UZ').format(a||0);
 function toast(m,e){const t2=document.getElementById('toast');t2.textContent=m;t2.className='toast sh'+(e?' er':'');setTimeout(()=>t2.classList.remove('sh'),3000)}
 function toggleTheme(){snd2();const b=document.body,d=b.getAttribute('data-theme')==='dark';b.setAttribute('data-theme',d?'light':'dark');localStorage.setItem('theme',d?'light':'dark');document.getElementById('ti').className=d?'fas fa-moon':'fas fa-sun'}
 
-// ===== PIN SYSTEM (FIXED) =====
 async function checkPin(){
 try{
 const s=await(await fetch('/api/settings',{headers:H})).json();
@@ -830,7 +786,6 @@ async def index():
     return HTMLResponse(HTML_TEMPLATE)
 
 
-# ============ BOT ============
 @dp.message(CommandStart())
 async def cmd_start(m: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📒 Ilovani ochish", web_app=WebAppInfo(url=WEBAPP_URL))]])
@@ -849,7 +804,6 @@ async def cmd_report(m: types.Message):
 
 @dp.message(Command("backup"))
 async def cmd_backup(m: types.Message):
-    """⚠️ MA'LUMOTLARNI SAQLASH — Telegram'da CSV fayl"""
     uid = m.from_user.id
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT name,phone,total_amount,currency,paid_amount,remaining_amount,status,rating,due_date,note,category,created_at FROM debtors WHERE user_id=?", (uid,))
