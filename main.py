@@ -22,7 +22,7 @@ from aiogram.client.default import DefaultBotProperties
 
 # ============ KONFIGURATSIYA ============
 BOT_TOKEN = "8651436055:AAH3FgpFyhcnBo4RXXYQpLMv1Wk4qNiCXX0"
-WEBAPP_URL = "https://happy-wasps-shine.loca.lt"  # O'z URL'ingizni qo'ying
+WEBAPP_URL = "https://qarz-daftar-bot.onrender.com"
 DB_PATH = "qarz_daftar.db"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -1326,6 +1326,14 @@ def run_bot():
     except Exception as e:
         logger.error(f"Bot xatosi: {e}")
 
+
+# ============ WEBHOOK (Render uchun) ============
+@app.post("/webhook")
+async def webhook(request: Request):
+    data = await request.json()
+    update = types.Update(**data)
+    await dp.feed_update(bot, update)
+    return {"ok": True}
 
 # ============ MAIN ============
 if __name__ == "__main__":
