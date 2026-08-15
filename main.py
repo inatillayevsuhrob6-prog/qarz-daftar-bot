@@ -56,6 +56,11 @@ class PaymentCreate(BaseModel):
     note: Optional[str] = None
 
 
+class SendMessage(BaseModel):
+    debtor_id: int
+    message: str
+
+
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""CREATE TABLE IF NOT EXISTS debtors (
@@ -63,11 +68,13 @@ async def init_db():
             phone TEXT,category TEXT DEFAULT 'Shaxsiy',note TEXT,total_amount REAL NOT NULL,
             paid_amount REAL DEFAULT 0,remaining_amount REAL NOT NULL,currency TEXT DEFAULT 'UZS',
             status TEXT DEFAULT 'ACTIVE',rating INTEGER DEFAULT 3,image_path TEXT,due_date TEXT,
+            telegram_id_target INTEGER,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
         await db.execute("""CREATE TABLE IF NOT EXISTS payments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,debtor_id INTEGER NOT NULL,amount REAL NOT NULL,
             note TEXT,payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-        for col, typ in [("currency", "TEXT DEFAULT 'UZS'"), ("rating", "INTEGER DEFAULT 3"), ("image_path", "TEXT")]:
+        for col, typ in [("currency", "TEXT DEFAULT 'UZS'"), ("rating", "INTEGER DEFAULT 3"), 
+                         ("image_path", "TEXT"), ("telegram_id_target", "INTEGER")]:
             try:
                 await db.execute(f"ALTER TABLE debtors ADD COLUMN {col} {typ}")
             except Exception:
@@ -268,6 +275,29 @@ async def serve_image(filename: str):
     return Response(content, media_type=media_type)
 
 
+@app.post("/api/send-message")
+async def send_message(data: SendMessage, user: dict = Depends(get_current_user)):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT name, telegram_id_target FROM debtors WHERE id=? AND user_id=?", 
+                               (data.debtor_id, user["telegram_id"]))
+        row = await cur.fetchone()
+    
+    if not row:
+        raise HTTPException(404, "Qarzdor topilmadi")
+    
+    target_id = row["telegram_id_target"]
+    if not target_id:
+        raise HTTPException(400, "Qarzdorning Telegram ID si yo'q. Avval /start orqali bog'lang.")
+    
+    try:
+        await bot.send_message(target_id, f"💌 <b>Xabar:</b>\n\n{data.message}\n\n— {user['first_name']}", parse_mode="HTML")
+        return {"ok": True, "message": "Xabar yuborildi!"}
+    except Exception as e:
+        logger.error(f"Xabar yuborish xatosi: {e}")
+        raise HTTPException(500, f"Xabar yuborilmadi: {str(e)}")
+
+
 @app.get("/api/export/pdf")
 async def export_pdf(user: dict = Depends(get_current_user), lang: str = "uz"):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -406,6 +436,7 @@ body::before{content:'';position:fixed;inset:-50%;background:radial-gradient(cir
 .ba2{flex:1;min-width:70px;padding:11px;border:none;border-radius:12px;font-size:13px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px}
 .bpay{background:linear-gradient(135deg,var(--ok),#059669);color:#fff}
 .bwa{background:#25D366;color:#fff}.brem{background:linear-gradient(135deg,#3b82f6,#2563eb);color:#fff}
+.bmsg{background:linear-gradient(135deg,#8b5cf6,#7c3aed);color:#fff}
 .bdel{background:rgba(239,68,68,.15);color:var(--err)}
 .bhist{background:rgba(139,92,246,.15);color:#8b5cf6}
 .bimg{background:rgba(245,158,11,.15);color:#f59e0b}
@@ -434,7 +465,6 @@ body::before{content:'';position:fixed;inset:-50%;background:radial-gradient(cir
 .ls{display:flex;gap:7px;margin-bottom:16px}
 .lb{flex:1;padding:11px;border:2px solid rgba(0,0,0,.1);border-radius:12px;background:var(--card);cursor:pointer;font-weight:700;font-size:12px;color:var(--txt)}
 .lb.ac{background:linear-gradient(135deg,var(--pri),var(--acc));color:#fff;border-color:transparent}
-.rb{background:var(--card);border-radius:22px;padding:20px;box-shadow:var(--sh)}
 .pay-item{padding:12px;background:rgba(0,0,0,.03);border-radius:12px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}
 .cur-sel{display:flex;gap:6px;margin-bottom:14px}
 .cur-btn{flex:1;padding:10px;border:2px solid rgba(0,0,0,.1);border-radius:12px;background:var(--card);cursor:pointer;font-weight:700;font-size:13px;color:var(--txt)}
@@ -484,19 +514,10 @@ body::before{content:'';position:fixed;inset:-50%;background:radial-gradient(cir
 <div class="ls">
 <button class="lb ac" onclick="setRL('uz',this)">🇺🇿 O'zbek</button>
 <button class="lb" onclick="setRL('ru',this)">🇷🇺 Рус</button>
-<button class="lb" onclick="setRL('en',this)">🇬🇧 EN</button>
+<button class="lb" onclick="setRL('en',this)">🇬 EN</button>
 </div>
 <button class="mb" onclick="downloadPDF()"><i class="fas fa-download"></i><span data-i18n="downloadPdf">PDF yuklab olish</span></button>
 <button class="mb" style="background:linear-gradient(135deg,#10b981,#059669)" onclick="downloadCSV()"><i class="fas fa-file-csv"></i><span>CSV yuklab olish</span></button>
-</div>
-
-<div id="page-settings" class="page">
-<div class="st"><i class="fas fa-cog"></i><span data-i18n="settings">Sozlamalar</span></div>
-<div class="cc">
-<h3 style="margin-bottom:12px">💱 Valyuta kurslari</h3>
-<div id="ratesBox" style="font-size:14px"></div>
-<p style="font-size:11px;color:var(--mut);margin-top:10px">Kurslar har kuni avtomatik yangilanadi</p>
-</div>
 </div>
 </div>
 
@@ -505,7 +526,6 @@ body::before{content:'';position:fixed;inset:-50%;background:radial-gradient(cir
 <button class="ni" onclick="sw('top',this)"><i class="fas fa-trophy"></i><span>TOP</span></button>
 <button class="ni" onclick="sw('stats',this)"><i class="fas fa-chart-pie"></i><span>Stat</span></button>
 <button class="ni" onclick="sw('report',this)"><i class="fas fa-file-pdf"></i><span>PDF</span></button>
-<button class="ni" onclick="sw('settings',this)"><i class="fas fa-cog"></i><span>⚙️</span></button>
 </div>
 
 <div id="addM" class="mo"><div class="mc">
@@ -516,7 +536,7 @@ body::before{content:'';position:fixed;inset:-50%;background:radial-gradient(cir
 <div class="fg"><label class="fl" data-i18n="amount">Summa *</label><input type="number" class="fi" id="aam" placeholder="1000000"></div>
 </div>
 <div class="fg"><label class="fl" data-i18n="currency">Valyuta</label>
-<div class="cur-sel"><button class="cur-btn ac" onclick="selCur('UZS',this)">🇺🇿 UZS</button><button class="cur-btn" onclick="selCur('USD',this)">🇸 USD</button><button class="cur-btn" onclick="selCur('EUR',this)">🇪 EUR</button></div>
+<div class="cur-sel"><button class="cur-btn ac" onclick="selCur('UZS',this)">🇺 UZS</button><button class="cur-btn" onclick="selCur('USD',this)">🇸 USD</button><button class="cur-btn" onclick="selCur('EUR',this)">🇪 EUR</button></div>
 <input type="hidden" id="acur" value="UZS"></div>
 <div class="fr">
 <div class="fg"><label class="fl" data-i18n="dueDate">Muddat</label><input type="date" class="fi" id="adt"></div>
@@ -550,8 +570,16 @@ body::before{content:'';position:fixed;inset:-50%;background:radial-gradient(cir
 <button class="bs" onclick="uploadImg()"><i class="fas fa-upload"></i> Yuklash</button>
 </div></div>
 
+<div id="msgM" class="mo"><div class="mc">
+<div class="mh"><h2 class="mt">💌 Xabar yuborish</h2><button class="mx" onclick="cm('msgM')"><i class="fas fa-times"></i></button></div>
+<input type="hidden" id="msgId">
+<div class="fg"><label class="fl">Xabar matni</label><textarea class="fi" id="msgTxt" rows="5" placeholder="Qarzdorga xabar yozing..."></textarea></div>
+<p style="font-size:12px;color:var(--mut);margin-bottom:14px">⚠️ Qarzdor avval botga /start bosgan bo'lishi kerak</p>
+<button class="bs" onclick="sendMsg()"><i class="fas fa-paper-plane"></i> Yuborish</button>
+</div></div>
+
 <div id="remM" class="mo"><div class="mc">
-<div class="mh"><h2 class="mt">🔔 Eslatma</h2><button class="mx" onclick="cm('remM')"><i class="fas fa-times"></i></button></div>
+<div class="mh"><h2 class="mt"> Eslatma</h2><button class="mx" onclick="cm('remM')"><i class="fas fa-times"></i></button></div>
 <textarea class="fi" id="remTxt" rows="6"></textarea>
 <p style="font-size:12px;color:var(--mut);margin:12px 0">Nusxalab, qarzdorga Telegram/WhatsApp orqali yuboring</p>
 <button class="bs" onclick="copyRem()"><i class="fas fa-copy"></i> Nusxalash</button>
@@ -566,15 +594,15 @@ let audioCtx=null;
 function initAudio(){if(!audioCtx){try{audioCtx=new(window.AudioContext||window.webkitAudioContext)()}catch(e){}}if(audioCtx&&audioCtx.state==='suspended'){audioCtx.resume()}return audioCtx}
 
 const T={
-uz:{appTitle:"Qarz Daftar",totalGiven:"Jami berilgan",remaining:"Qolgan",paid:"Tolangan",debtors:"Qarzdorlar",addDebtor:"Yangi qarzdor",debtorList:"Qarzdorlar",topDebtors:"TOP Qarzdorlar",statistics:"Statistika",reports:"Hisobotlar",downloadPdf:"PDF yuklab olish",settings:"Sozlamalar",navHome:"Bosh",newDebtor:"Yangi qarzdor",name:"Ism *",phone:"Telefon",amount:"Summa *",currency:"Valyuta",dueDate:"Muddat",category:"Kategoriya",note:"Izoh",save:"Saqlash",addPayment:"To'lov",confirm:"Tasdiqlash",pay:"To'lov",delete:"O'chirish",noDebtors:"Hali qarzdor yo'q",tapAbove:"Yuqoridagi tugmani bosing",debtorAdded:"Qo'shildi! ✨",paymentReceived:"Qabul qilindi! 💰🎉",deleted:"O'chirildi!",confirmDelete:"O'chirilsinmi?",nameAmountRequired:"Ism va summa majburiy!",invalidAmount:"Noto'g'ri summa",total:"Jami",paidAmount:"Tolangan",statusActive:"Faol",statusOverdue:"Muddati o'tgan",statusPaid:"To'langan",copied:"Nusxalandi!"},
-ru:{appTitle:"Долговая Книга",totalGiven:"Выдано",remaining:"Остаток",paid:"Оплачено",debtors:"Должники",addDebtor:"Новый должник",debtorList:"Должники",topDebtors:"ТОП Должники",statistics:"Статистика",reports:"Отчёты",downloadPdf:"Скачать PDF",settings:"Настройки",navHome:"Главная",newDebtor:"Новый должник",name:"Имя *",phone:"Телефон",amount:"Сумма *",currency:"Валюта",dueDate:"Срок",category:"Категория",note:"Примечание",save:"Сохранить",addPayment:"Платёж",confirm:"Подтвердить",pay:"Оплата",delete:"Удалить",noDebtors:"Нет должников",tapAbove:"Нажмите кнопку выше",debtorAdded:"Добавлен! ✨",paymentReceived:"Принят! 💰🎉",deleted:"Удалено!",confirmDelete:"Удалить?",nameAmountRequired:"Имя и сумма обязательны!",invalidAmount:"Неверная сумма",total:"Всего",paidAmount:"Оплачено",statusActive:"Активен",statusOverdue:"Просрочен",statusPaid:"Оплачен",copied:"Скопировано!"},
-en:{appTitle:"Debt Book",totalGiven:"Total Given",remaining:"Remaining",paid:"Paid",debtors:"Debtors",addDebtor:"New Debtor",debtorList:"Debtors",topDebtors:"TOP Debtors",statistics:"Statistics",reports:"Reports",downloadPdf:"Download PDF",settings:"Settings",navHome:"Home",newDebtor:"New Debtor",name:"Name *",phone:"Phone",amount:"Amount *",currency:"Currency",dueDate:"Due Date",category:"Category",note:"Note",save:"Save",addPayment:"Payment",confirm:"Confirm",pay:"Pay",delete:"Delete",noDebtors:"No debtors yet",tapAbove:"Tap the button above",debtorAdded:"Added! ✨",paymentReceived:"Received! 💰🎉",deleted:"Deleted!",confirmDelete:"Delete?",nameAmountRequired:"Name and amount required!",invalidAmount:"Invalid amount",total:"Total",paidAmount:"Paid",statusActive:"Active",statusOverdue:"Overdue",statusPaid:"Paid",copied:"Copied!"}
+uz:{appTitle:"Qarz Daftar",totalGiven:"Jami berilgan",remaining:"Qolgan",paid:"Tolangan",debtors:"Qarzdorlar",addDebtor:"Yangi qarzdor",debtorList:"Qarzdorlar",topDebtors:"TOP Qarzdorlar",statistics:"Statistika",reports:"Hisobotlar",downloadPdf:"PDF yuklab olish",navHome:"Bosh",newDebtor:"Yangi qarzdor",name:"Ism *",phone:"Telefon",amount:"Summa *",currency:"Valyuta",dueDate:"Muddat",category:"Kategoriya",note:"Izoh",save:"Saqlash",addPayment:"To'lov",confirm:"Tasdiqlash",pay:"To'lov",delete:"O'chirish",noDebtors:"Hali qarzdor yo'q",tapAbove:"Yuqoridagi tugmani bosing",debtorAdded:"Qo'shildi! ✨",paymentReceived:"Qabul qilindi! 💰🎉",deleted:"O'chirildi!",confirmDelete:"O'chirilsinmi?",nameAmountRequired:"Ism va summa majburiy!",invalidAmount:"Noto'g'ri summa",total:"Jami",paidAmount:"Tolangan",statusActive:"Faol",statusOverdue:"Muddati o'tgan",statusPaid:"To'langan",copied:"Nusxalandi!",msgSent:"Xabar yuborildi! ✅",msgError:"Xabar yuborilmadi"},
+ru:{appTitle:"Долговая Книга",totalGiven:"Выдано",remaining:"Остаток",paid:"Оплачено",debtors:"Должники",addDebtor:"Новый должник",debtorList:"Должники",topDebtors:"ТОП Должники",statistics:"Статистика",reports:"Отчёты",downloadPdf:"Скачать PDF",navHome:"Главная",newDebtor:"Новый должник",name:"Имя *",phone:"Телефон",amount:"Сумма *",currency:"Валюта",dueDate:"Срок",category:"Категория",note:"Примечание",save:"Сохранить",addPayment:"Платёж",confirm:"Подтвердить",pay:"Оплата",delete:"Удалить",noDebtors:"Нет должников",tapAbove:"Нажмите кнопку выше",debtorAdded:"Добавлен! ✨",paymentReceived:"Принят! 💰🎉",deleted:"Удалено!",confirmDelete:"Удалить?",nameAmountRequired:"Имя и сумма обязательны!",invalidAmount:"Неверная сумма",total:"Всего",paidAmount:"Оплачено",statusActive:"Активен",statusOverdue:"Просрочен",statusPaid:"Оплачен",copied:"Скопировано!",msgSent:"Сообщение отправлено! ✅",msgError:"Сообщение не отправлено"},
+en:{appTitle:"Debt Book",totalGiven:"Total Given",remaining:"Remaining",paid:"Paid",debtors:"Debtors",addDebtor:"New Debtor",debtorList:"Debtors",topDebtors:"TOP Debtors",statistics:"Statistics",reports:"Reports",downloadPdf:"Download PDF",navHome:"Home",newDebtor:"New Debtor",name:"Name *",phone:"Phone",amount:"Amount *",currency:"Currency",dueDate:"Due Date",category:"Category",note:"Note",save:"Save",addPayment:"Payment",confirm:"Confirm",pay:"Pay",delete:"Delete",noDebtors:"No debtors yet",tapAbove:"Tap the button above",debtorAdded:"Added! ✨",paymentReceived:"Received! 💰",deleted:"Deleted!",confirmDelete:"Delete?",nameAmountRequired:"Name and amount required!",invalidAmount:"Invalid amount",total:"Total",paidAmount:"Paid",statusActive:"Active",statusOverdue:"Overdue",statusPaid:"Paid",copied:"Copied!",msgSent:"Message sent! ✅",msgError:"Message not sent"}
 };
 function t(k){return T[LANG][k]||k}
 function ut(){document.querySelectorAll('[data-i18n]').forEach(e=>e.textContent=t(e.getAttribute('data-i18n')))}
 function toggleLang(){snd2();const L=['uz','ru','en'];LANG=L[(L.indexOf(LANG)+1)%3];localStorage.setItem('lang',LANG);ut();load();toast('🌐 '+LANG.toUpperCase())}
 function setRL(l,b){snd2();RL=l;document.querySelectorAll('.lb').forEach(x=>x.classList.remove('ac'));b.classList.add('ac')}
-function sw(p,b){snd2();document.querySelectorAll('.page').forEach(x=>x.classList.remove('ac'));document.getElementById('page-'+p).classList.add('ac');document.querySelectorAll('.ni').forEach(n=>n.classList.remove('ac'));b.classList.add('ac');if(p==='stats')charts();if(p==='top')loadTop();if(p==='settings')loadSettings()}
+function sw(p,b){snd2();document.querySelectorAll('.page').forEach(x=>x.classList.remove('ac'));document.getElementById('page-'+p).classList.add('ac');document.querySelectorAll('.ni').forEach(n=>n.classList.remove('ac'));b.classList.add('ac');if(p==='stats')charts();if(p==='top')loadTop()}
 function selCur(c,b){document.querySelectorAll('.cur-btn').forEach(x=>x.classList.remove('ac'));b.classList.add('ac');document.getElementById('acur').value=c}
 
 function snd1(){const c=initAudio();if(!c)return;try{const o=c.createOscillator(),g=c.createGain();o.connect(g);g.connect(c.destination);o.frequency.setValueAtTime(523.25,c.currentTime);o.frequency.setValueAtTime(659.25,c.currentTime+.1);o.frequency.setValueAtTime(783.99,c.currentTime+.2);g.gain.setValueAtTime(.3,c.currentTime);g.gain.exponentialRampToValueAtTime(.01,c.currentTime+.5);o.start(c.currentTime);o.stop(c.currentTime+.5)}catch(e){}}
@@ -585,11 +613,6 @@ function fm(a,c){c=c||'UZS';const s=new Intl.NumberFormat('uz-UZ').format(a||0);
 function toast(m,e){const t2=document.getElementById('toast');t2.textContent=m;t2.className='toast sh'+(e?' er':'');setTimeout(()=>t2.classList.remove('sh'),3000)}
 function toggleTheme(){snd2();const b=document.body,d=b.getAttribute('data-theme')==='dark';b.setAttribute('data-theme',d?'light':'dark');localStorage.setItem('theme',d?'light':'dark');document.getElementById('ti').className=d?'fas fa-moon':'fas fa-sun'}
 
-async function loadSettings(){
-try{const st=await(await fetch('/api/stats',{headers:H})).json();
-const r=st.rates||{};
-document.getElementById('ratesBox').innerHTML='💵 1 USD = '+(r.UZS?Math.round(r.UZS).toLocaleString():'—')+' UZS<br>💶 1 EUR = '+(r.UZS&&r.EUR?Math.round(r.UZS/r.EUR).toLocaleString():'—')+' UZS'}catch(e){}}
-
 async function load(){
 try{const s=await(await fetch('/api/stats',{headers:H})).json();
 document.getElementById('tg').textContent=fm(s.total_given);document.getElementById('tr').textContent=fm(s.total_remaining);
@@ -598,7 +621,7 @@ const ds=await(await fetch('/api/debtors',{headers:H})).json();
 const l=document.getElementById('dl');
 if(!ds.length){l.innerHTML='<div class="es"><div class="ei"><i class="fas fa-inbox"></i></div><p style="font-size:16px;font-weight:600">'+t('noDebtors')+'</p><p style="font-size:12px;margin-top:6px;opacity:.7">'+t('tapAbove')+'</p></div>';return}
 l.innerHTML=ds.map((d,i)=>{const sc=d.status==='OVERDUE'?'overdue':d.status==='PAID'?'paid':'';const bc=d.status==='OVERDUE'?'bo':d.status==='PAID'?'bp':'ba';const st=d.status==='OVERDUE'?t('statusOverdue'):d.status==='PAID'?t('statusPaid'):t('statusActive');const stars='⭐'.repeat(d.rating||3);const c=d.currency||'UZS';
-return '<div class="dc '+sc+'"><div class="dh"><div><div class="dn">'+d.name+'</div><div class="rat" id="rat-'+d.id+'">'+stars+'</div></div><div class="da">'+fm(d.remaining_amount,c)+'</div></div><div class="di">'+(d.phone?'<a href="tel:'+d.phone.replace(/[^+0-9]/g,'')+'"><i class="fas fa-phone"></i> '+d.phone+'</a>':'<span><i class="fas fa-phone"></i> -</span>')+'<span><i class="fas fa-tag"></i>'+d.category+'</span><span><i class="fas fa-coins"></i>'+c+'</span>'+(d.due_date?'<span><i class="fas fa-calendar"></i>'+d.due_date+'</span>':'')+'</div><span class="badge '+bc+'">'+st+'</span>'+(d.image_path?'<div style="margin-bottom:10px"><img src="'+d.image_path+'" style="max-width:100%;max-height:120px;border-radius:10px"></div>':'')+'<div class="dd"><b>'+t('total')+':</b> '+fm(d.total_amount,c)+' | <b>'+t('paidAmount')+':</b> '+fm(d.paid_amount,c)+'</div><div class="dac">'+(d.status!=='PAID'?'<button class="ba2 bpay" onclick="op('+d.id+','+d.remaining_amount+')"><i class="fas fa-money-bill-wave"></i>'+t('pay')+'</button>':'')+(d.phone?'<button class="ba2 bwa" onclick="wa(\\''+d.phone.replace(/[^+0-9]/g,'')+'\\')"><i class="fab fa-whatsapp"></i></button>':'')+'<button class="ba2 brem" onclick="rem('+d.id+')"><i class="fas fa-bell"></i></button><button class="ba2 bhist" onclick="hist('+d.id+')"><i class="fas fa-history"></i></button><button class="ba2 bimg" onclick="opImg('+d.id+',\\''+(d.image_path||'')+'\\')"><i class="fas fa-camera"></i></button><button class="ba2 bdel" onclick="delD('+d.id+')"><i class="fas fa-trash"></i></button></div></div>'}).join('');
+return '<div class="dc '+sc+'"><div class="dh"><div><div class="dn">'+d.name+'</div><div class="rat" id="rat-'+d.id+'">'+stars+'</div></div><div class="da">'+fm(d.remaining_amount,c)+'</div></div><div class="di">'+(d.phone?'<a href="tel:'+d.phone.replace(/[^+0-9]/g,'')+'"><i class="fas fa-phone"></i> '+d.phone+'</a>':'<span><i class="fas fa-phone"></i> -</span>')+'<span><i class="fas fa-tag"></i>'+d.category+'</span><span><i class="fas fa-coins"></i>'+c+'</span>'+(d.due_date?'<span><i class="fas fa-calendar"></i>'+d.due_date+'</span>':'')+'</div><span class="badge '+bc+'">'+st+'</span>'+(d.image_path?'<div style="margin-bottom:10px"><img src="'+d.image_path+'" style="max-width:100%;max-height:120px;border-radius:10px"></div>':'')+'<div class="dd"><b>'+t('total')+':</b> '+fm(d.total_amount,c)+' | <b>'+t('paidAmount')+':</b> '+fm(d.paid_amount,c)+'</div><div class="dac">'+(d.status!=='PAID'?'<button class="ba2 bpay" onclick="op('+d.id+','+d.remaining_amount+')"><i class="fas fa-money-bill-wave"></i>'+t('pay')+'</button>':'')+(d.phone?'<button class="ba2 bwa" onclick="wa(\\''+d.phone.replace(/[^+0-9]/g,'')+'\\')"><i class="fab fa-whatsapp"></i></button>':'')+'<button class="ba2 bmsg" onclick="openMsg('+d.id+')"><i class="fas fa-paper-plane"></i></button><button class="ba2 brem" onclick="rem('+d.id+')"><i class="fas fa-bell"></i></button><button class="ba2 bhist" onclick="hist('+d.id+')"><i class="fas fa-history"></i></button><button class="ba2 bimg" onclick="opImg('+d.id+',\\''+(d.image_path||'')+'\\')"><i class="fas fa-camera"></i></button><button class="ba2 bdel" onclick="delD('+d.id+')"><i class="fas fa-trash"></i></button></div></div>'}).join('');
 ds.forEach(d=>{const el=document.getElementById('rat-'+d.id);if(el){el.innerHTML='';for(let i=1;i<=5;i++){const sp=document.createElement('span');sp.textContent=i<=(d.rating||3)?'⭐':'☆';sp.style.cursor='pointer';sp.onclick=()=>setR2(d.id,i);el.appendChild(sp)}}})
 }catch(e){console.error(e);toast('Xato',true)}}
 
@@ -627,6 +650,9 @@ try{const r=await fetch('/api/debtors/'+id+'/pay',{method:'PUT',headers:H,body:J
 
 async function setR2(id,r){snd2();try{await fetch('/api/debtors/'+id+'/rating?rating='+r,{method:'PUT',headers:H});load()}catch(e){}}
 function wa(ph){snd2();window.open('https://wa.me/'+ph.replace(/^\\+/,''),'_blank')}
+function openMsg(id){snd2();document.getElementById('msgId').value=id;document.getElementById('msgTxt').value='';document.getElementById('msgM').classList.add('ac')}
+async function sendMsg(){const id=document.getElementById('msgId').value,msg=document.getElementById('msgTxt').value.trim();if(!msg){toast('Xabar yozing',true);return}
+try{const r=await fetch('/api/send-message',{method:'POST',headers:H,body:JSON.stringify({debtor_id:parseInt(id),message:msg})});if(!r.ok){const err=await r.json();throw new Error(err.detail||'Xato')}snd1();toast('✅ '+t('msgSent'));cm('msgM')}catch(e){toast('❌ '+t('msgError')+': '+e.message,true)}}
 async function rem(id){snd2();try{const r=await(await fetch('/api/remind/'+id,{headers:H})).json();document.getElementById('remTxt').value=r.text;document.getElementById('remM').classList.add('ac')}catch(e){toast('Xato',true)}}
 function copyRem(){const tx=document.getElementById('remTxt');tx.select();navigator.clipboard.writeText(tx.value);toast('✅ '+t('copied'))}
 async function hist(id){snd2();try{const ps=await(await fetch('/api/payments/'+id,{headers:H})).json();const l=document.getElementById('histList');if(!ps.length){l.innerHTML='<p style="text-align:center;color:var(--mut);padding:30px">Hali to\'lov yo\\'q</p>'}else{l.innerHTML=ps.map(p=>'<div class="pay-item"><div><div style="font-weight:700">'+fm(p.amount)+'</div><div style="font-size:11px;color:var(--mut)">'+(p.note||'—')+'</div></div><div style="font-size:11px;color:var(--mut)">'+new Date(p.payment_date).toLocaleDateString()+'</div></div>').join('')}document.getElementById('histM').classList.add('ac')}catch(e){}}
@@ -649,8 +675,26 @@ async def index():
 
 @dp.message(CommandStart())
 async def cmd_start(m: types.Message):
+    uid = m.from_user.id
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📒 Ilovani ochish", web_app=WebAppInfo(url=WEBAPP_URL))]])
-    await m.answer("<b>💎 Qarz Daftar Pro</b>\n\n📸 Rasm biriktirish\n🖨️ PDF hisobot (3 til)\n🏆 TOP qarzdorlar\n⭐ Ishonch reytingi\n🔔 Eslatma matni\n💱 Multi-valyuta\n💳 To'lovlar tarixi\n\nTugmani bosing 👇", reply_markup=kb)
+    await m.answer(f"<b>💎 Qarz Daftar Pro</b>\n\nSizning ID: <code>{uid}</code>\n\n📸 Rasm biriktirish\n🖨️ PDF hisobot (3 til)\n🏆 TOP qarzdorlar\n⭐ Ishonch reytingi\n💌 Xabar yuborish\n💱 Multi-valyuta\n💳 To'lovlar tarixi\n\nTugmani bosing ", reply_markup=kb)
+
+
+@dp.message(Command("link"))
+async def cmd_link(m: types.Message):
+    args = m.text.split()
+    if len(args) < 2:
+        await m.answer("❌ /link <debtor_id> — qarzdorni bog'lash")
+        return
+    try:
+        debtor_id = int(args[1])
+        uid = m.from_user.id
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE debtors SET telegram_id_target=? WHERE id=?", (uid, debtor_id))
+            await db.commit()
+        await m.answer(f"✅ Bog'landi! Endi sizga xabar yuborish mumkin.\n\nDebtor ID: {debtor_id}")
+    except Exception as e:
+        await m.answer(f"❌ Xato: {e}")
 
 
 @dp.message(Command("report"))
@@ -684,7 +728,7 @@ async def cmd_backup(m: types.Message):
         lines.append(";".join("" if x is None else str(x) for x in p))
     
     await m.answer_document(FSInputFile(BytesIO("\n".join(lines).encode("utf-8")), filename=f"backup_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"))
-    await m.answer("✅ Backup tayyor!\n\n📥 Bu faylni Telegram'da saqlab qo'ying.\n\n⚠️ Render bepul tarifda ma'lumotlar har deploy'da o'chirilishi mumkin. Haftada 1 marta `/backup` qiling!")
+    await m.answer("✅ Backup tayyor!\n\n Bu faylni Telegram'da saqlab qo'ying.\n\n⚠️ Render bepul tarifda ma'lumotlar har deploy'da o'chirilishi mumkin. Haftada 1 marta `/backup` qiling!")
 
 
 def run_bot():
