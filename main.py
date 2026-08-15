@@ -8,22 +8,30 @@ import threading
 from datetime import datetime, date, timedelta
 from typing import Optional
 from urllib.parse import parse_qsl
+from io import BytesIO
 
 import aiosqlite
+import httpx
 import uvicorn
-from fastapi import FastAPI, Request, HTTPException, Depends
-from fastapi.responses import HTMLResponse, Response
+from fastapi import FastAPI, Request, HTTPException, Depends, UploadFile, File
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import CommandStart, Command
-from aiogram.types import WebAppInfo, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import WebAppInfo, InlineKeyboardButton, InlineKeyboardMarkup, FSInputFile
 from aiogram.client.default import DefaultBotProperties
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 
 # ============ KONFIGURATSIYA ============
 BOT_TOKEN = "8651436055:AAH3FgpFyhcnBo4RXXYQpLMv1Wk4qNiCXX0"
 WEBAPP_URL = "https://qarz-daftar-bot.onrender.com"
 DB_PATH = "qarz_daftar.db"
+IMAGES_DIR = "images"
+os.makedirs(IMAGES_DIR, exist_ok=True)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -31,20 +39,29 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
+# Valyuta kurslari keshi
+currency_cache = {"rates": {}, "updated": 0}
+
 
 # ============ MODELS ============
 class DebtorCreate(BaseModel):
     name: str
     phone: Optional[str] = None
     amount: float
+    currency: str = "UZS"
     due_date: Optional[str] = None
     category: str = "Shaxsiy"
     note: Optional[str] = None
+    rating: int = 3
 
 
 class PaymentCreate(BaseModel):
     amount: float
     note: Optional[str] = None
+
+
+class PinSet(BaseModel):
+    pin: Optional[str] = None
 
 
 # ============ DATABASE ============
@@ -61,7 +78,10 @@ async def init_db():
                 total_amount REAL NOT NULL,
                 paid_amount REAL DEFAULT 0,
                 remaining_amount REAL NOT NULL,
+                currency TEXT DEFAULT 'UZS',
                 status TEXT DEFAULT 'ACTIVE',
+                rating INTEGER DEFAULT 3,
+                image_path TEXT,
                 due_date TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -75,391 +95,132 @@ async def init_db():
                 payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                user_id INTEGER PRIMARY KEY,
+                pin_code TEXT,
+                language TEXT DEFAULT 'uz',
+                theme TEXT DEFAULT 'light'
+            )
+        """)
+        # Eski DB uchun ustunlarni qo'shish
+        for col, typ in [("currency", "TEXT DEFAULT 'UZS'"), ("rating", "INTEGER DEFAULT 3"), ("image_path", "TEXT")]:
+            try:
+                await db.execute(f"ALTER TABLE debtors ADD COLUMN {col} {typ}")
+            except Exception:
+                pass
         await db.commit()
     logger.info("✅ Database yaratildi")
+
+
+# ============ VALYUTA KURSLARI ============
+async def get_currency_rates():
+    now = datetime.now().timestamp()
+    if currency_cache["rates"] and now - currency_cache["updated"] < 86400:
+        return currency_cache["rates"]
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get("https://open.er-api.com/v6/latest/USD")
+            data = r.json()
+            rates = data.get("rates", {})
+            currency_cache["rates"] = {
+                "USD": 1.0,
+                "EUR": rates.get("EUR", 0.92),
+                "UZS": rates.get("UZS", 12500)
+            }
+            currency_cache["updated"] = now
+            logger.info("💱 Valyuta kurslari yangilandi")
+    except Exception as e:
+        logger.warning(f"Kurs olish xatosi: {e}")
+        if not currency_cache["rates"]:
+            currency_cache["rates"] = {"USD": 1.0, "EUR": 0.92, "UZS": 12500}
+    return currency_cache["rates"]
+
+
+def convert_amount(amount: float, from_cur: str, to_cur: str, rates: dict) -> float:
+    usd = amount / rates.get(from_cur, 1)
+    return usd * rates.get(to_cur, 1)
 
 
 # ============ AUTH ============
 def verify_telegram_auth(init_data: str) -> dict:
     if not init_data:
-        raise HTTPException(status_code=401, detail="Telegram auth yo'q")
+        raise HTTPException(status_code=401, detail="Auth yo'q")
     try:
         data = dict(parse_qsl(init_data))
         received_hash = data.pop("hash", None)
         if not received_hash:
-            raise HTTPException(status_code=401, detail="Hash yo'q")
-        check_list = [f"{k}={data[k]}" for k in sorted(data.keys())]
-        check_string = "\n".join(check_list)
+            raise HTTPException(401)
+        check_string = "\n".join(f"{k}={data[k]}" for k in sorted(data.keys()))
         secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
         calculated_hash = hmac.new(secret_key, check_string.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(calculated_hash, received_hash):
-            raise HTTPException(status_code=401, detail="Hash xato")
+            raise HTTPException(401)
         user_data = json.loads(data.get("user", "{}"))
-        return {
-            "telegram_id": user_data.get("id"),
-            "username": user_data.get("username", ""),
-            "first_name": user_data.get("first_name", ""),
-            "last_name": user_data.get("last_name", "")
-        }
+        return {"telegram_id": user_data.get("id"), "username": user_data.get("username", ""),
+                "first_name": user_data.get("first_name", ""), "last_name": user_data.get("last_name", "")}
     except HTTPException:
         raise
-    except Exception as e:
-        logger.error(f"Auth xatosi: {e}")
-        raise HTTPException(status_code=401, detail="Auth xatosi")
+    except Exception:
+        raise HTTPException(401)
 
 
 async def get_current_user(request: Request) -> dict:
-    init_data = request.headers.get("X-Telegram-Init-Data")
-    if not init_data:
-        init_data = request.query_params.get("initData", "")
+    init_data = request.headers.get("X-Telegram-Init-Data") or request.query_params.get("initData", "")
     if not init_data:
         return {"telegram_id": 123456, "username": "test", "first_name": "Test", "last_name": "User"}
     return verify_telegram_auth(init_data)
 
 
 # ============ FASTAPI ============
-app = FastAPI(title="Qarz Daftar API")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="Qarz Daftar Pro API")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
 @app.on_event("startup")
 async def startup():
     await init_db()
+    await get_currency_rates()
     logger.info("🚀 Server ishga tushdi")
 
 
-# ============ HTML ============
-HTML_TEMPLATE = """<!DOCTYPE html>
-<html lang="uz">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>Qarz Daftar Pro</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
-<link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-<style>
-*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-:root{
---bg-gradient:linear-gradient(135deg,#667eea 0%,#764ba2 50%,#f093fb 100%);
---card-bg:rgba(255,255,255,0.98);
---primary:#667eea;--accent:#f093fb;--success:#10b981;--danger:#ef4444;--warning:#f59e0b;
---text:#1f2937;--text-light:#6b7280;
---shadow-sm:0 8px 32px rgba(0,0,0,0.12);--glow:0 0 40px rgba(102,126,234,0.4)}
-[data-theme="dark"]{
---bg-gradient:linear-gradient(135deg,#0f172a 0%,#1e293b 50%,#312e81 100%);
---card-bg:rgba(30,41,59,0.98);--text:#f8fafc;--text-light:#94a3b8;
---shadow-sm:0 8px 32px rgba(0,0,0,0.3)}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg-gradient);min-height:100vh;color:var(--text);padding:20px;padding-bottom:110px;overflow-x:hidden}
-body::before{content:'';position:fixed;top:-50%;left:-50%;width:200%;height:200%;background:radial-gradient(circle at 20% 50%,rgba(102,126,234,0.15) 0%,transparent 50%),radial-gradient(circle at 80% 80%,rgba(240,147,251,0.15) 0%,transparent 50%);pointer-events:none;z-index:0;animation:bgFloat 20s ease-in-out infinite}
-@keyframes bgFloat{0%,100%{transform:translate(0,0)}33%{transform:translate(30px,-30px)}66%{transform:translate(-20px,20px)}}
-.container{max-width:600px;margin:0 auto;position:relative;z-index:1}
-.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;animation:slideDown .6s cubic-bezier(.34,1.56,.64,1)}
-.logo{display:flex;align-items:center;gap:14px}
-.logo-icon{width:52px;height:52px;background:linear-gradient(135deg,var(--primary),var(--accent));border-radius:18px;display:flex;align-items:center;justify-content:center;font-size:26px;box-shadow:var(--glow);animation:pulse 2s ease-in-out infinite}
-@keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.05)}}
-.logo-text h1{font-size:24px;font-weight:900;background:linear-gradient(135deg,var(--primary),var(--accent));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.logo-text p{font-size:11px;color:var(--text-light);font-weight:500}
-.header-actions{display:flex;gap:10px}
-.icon-btn{width:44px;height:44px;border-radius:50%;background:var(--card-bg);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:18px;box-shadow:var(--shadow-sm);color:var(--text);transition:all .3s}
-.icon-btn:active{transform:scale(.85) rotate(180deg)}
-.stats-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;margin-bottom:24px}
-.stat-card{background:var(--card-bg);backdrop-filter:blur(20px);padding:20px;border-radius:24px;box-shadow:var(--shadow-sm);position:relative;overflow:hidden;animation:fadeInUp .5s ease backwards}
-.stat-card:nth-child(1){animation-delay:.1s}.stat-card:nth-child(2){animation-delay:.2s}
-.stat-card:nth-child(3){animation-delay:.3s}.stat-card:nth-child(4){animation-delay:.4s}
-.stat-card:active{transform:scale(.95)}
-.stat-icon{width:48px;height:48px;border-radius:16px;display:flex;align-items:center;justify-content:center;font-size:22px;margin-bottom:12px;color:#fff;box-shadow:0 8px 20px rgba(0,0,0,.15)}
-.stat-icon.blue{background:linear-gradient(135deg,#667eea,#764ba2)}
-.stat-icon.green{background:linear-gradient(135deg,#10b981,#059669)}
-.stat-icon.orange{background:linear-gradient(135deg,#f59e0b,#d97706)}
-.stat-icon.purple{background:linear-gradient(135deg,#8b5cf6,#7c3aed)}
-.stat-label{font-size:12px;color:var(--text-light);margin-bottom:4px;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
-.stat-value{font-size:22px;font-weight:900}
-.main-btn{width:100%;padding:18px;background:linear-gradient(135deg,var(--primary),var(--accent));border:none;border-radius:22px;color:#fff;font-size:17px;font-weight:800;cursor:pointer;margin-bottom:24px;box-shadow:0 12px 40px rgba(102,126,234,.5);display:flex;align-items:center;justify-content:center;gap:12px;transition:all .3s}
-.main-btn:active{transform:scale(.95)}
-.section-title{font-size:19px;font-weight:800;margin-bottom:16px;display:flex;align-items:center;gap:10px}
-.section-title i{color:var(--primary)}
-.debtor-card{background:var(--card-bg);backdrop-filter:blur(20px);padding:20px;border-radius:24px;margin-bottom:16px;box-shadow:var(--shadow-sm);position:relative;overflow:hidden;animation:slideIn .4s cubic-bezier(.34,1.56,.64,1) backwards}
-.debtor-card::before{content:'';position:absolute;left:0;top:0;bottom:0;width:5px;background:linear-gradient(180deg,var(--primary),var(--accent))}
-.debtor-card.overdue::before{background:linear-gradient(180deg,var(--danger),#dc2626)}
-.debtor-card.paid::before{background:linear-gradient(180deg,var(--success),#059669)}
-.debtor-header{display:flex;justify-content:space-between;align-items:start;margin-bottom:12px}
-.debtor-name{font-size:18px;font-weight:800}
-.debtor-amount{font-size:20px;font-weight:900;background:linear-gradient(135deg,var(--primary),var(--accent));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.debtor-info{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:12px;font-size:13px;color:var(--text-light)}
-.debtor-info span{display:flex;align-items:center;gap:6px}
-.debtor-info i{color:var(--primary)}
-.debtor-badge{display:inline-block;padding:6px 12px;border-radius:20px;font-size:11px;font-weight:700;margin-bottom:12px;text-transform:uppercase;letter-spacing:.5px}
-.badge-active{background:rgba(102,126,234,.15);color:var(--primary)}
-.badge-overdue{background:rgba(239,68,68,.15);color:var(--danger)}
-.badge-paid{background:rgba(16,185,129,.15);color:var(--success)}
-.debtor-details{font-size:12px;color:var(--text-light);margin-bottom:14px;padding:10px;background:rgba(0,0,0,.03);border-radius:12px}
-.debtor-actions{display:flex;gap:10px}
-.btn-action{flex:1;padding:13px;border:none;border-radius:14px;font-size:14px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;transition:all .3s}
-.btn-action:active{transform:scale(.9)}
-.btn-pay{background:linear-gradient(135deg,var(--success),#059669);color:#fff;box-shadow:0 8px 20px rgba(16,185,129,.4)}
-.btn-delete{background:rgba(239,68,68,.15);color:var(--danger)}
-.empty-state{text-align:center;padding:60px 20px;color:var(--text-light)}
-.empty-icon{font-size:70px;margin-bottom:16px;opacity:.2;animation:float 3s ease-in-out infinite}
-@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-20px)}}
-.modal-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);backdrop-filter:blur(12px);z-index:1000;align-items:flex-end;justify-content:center}
-.modal-overlay.active{display:flex;animation:fadeIn .3s}
-.modal-content{background:var(--card-bg);width:100%;max-width:600px;border-radius:32px 32px 0 0;padding:32px 24px;max-height:90vh;overflow-y:auto;animation:slideUp .4s cubic-bezier(.34,1.56,.64,1)}
-.modal-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:24px}
-.modal-title{font-size:24px;font-weight:900;background:linear-gradient(135deg,var(--primary),var(--accent));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
-.modal-close{width:38px;height:38px;border-radius:50%;background:rgba(0,0,0,.1);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:18px;color:var(--text)}
-.form-group{margin-bottom:20px}
-.form-label{display:block;font-size:13px;font-weight:700;margin-bottom:8px;text-transform:uppercase;letter-spacing:.5px}
-.form-input{width:100%;padding:16px;border:2px solid rgba(0,0,0,.1);border-radius:16px;font-size:16px;background:rgba(0,0,0,.03);color:var(--text);transition:all .3s}
-.form-input:focus{outline:none;border-color:var(--primary);box-shadow:0 0 0 4px rgba(102,126,234,.15)}
-.form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.btn-submit{width:100%;padding:18px;background:linear-gradient(135deg,var(--primary),var(--accent));border:none;border-radius:18px;color:#fff;font-size:17px;font-weight:800;cursor:pointer;margin-top:8px;box-shadow:0 12px 40px rgba(102,126,234,.5)}
-.btn-submit:active{transform:scale(.95)}
-.toast{position:fixed;top:30px;left:50%;transform:translateX(-50%) translateY(-150px);background:linear-gradient(135deg,var(--success),#059669);color:#fff;padding:16px 32px;border-radius:30px;font-weight:700;font-size:15px;box-shadow:0 15px 40px rgba(0,0,0,.3);z-index:2000;opacity:0;transition:all .4s cubic-bezier(.34,1.56,.64,1)}
-.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
-.toast.error{background:linear-gradient(135deg,var(--danger),#dc2626)}
-#confetti-canvas{position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:1500}
-.page{display:none}.page.active{display:block;animation:fadeIn .3s}
-.chart-container{background:var(--card-bg);border-radius:24px;padding:20px;margin-bottom:20px;box-shadow:var(--shadow-sm)}
-.nav-bottom{position:fixed;bottom:0;left:0;right:0;background:var(--card-bg);backdrop-filter:blur(20px);display:flex;justify-content:space-around;padding:10px 0 calc(10px + env(safe-area-inset-bottom));box-shadow:0 -8px 32px rgba(0,0,0,.1);z-index:100}
-.nav-item{display:flex;flex-direction:column;align-items:center;gap:4px;padding:6px 18px;border:none;background:none;cursor:pointer;color:var(--text-light);font-size:11px;font-weight:600;transition:all .3s}
-.nav-item i{font-size:20px;transition:all .3s}
-.nav-item.active{color:var(--primary)}
-.nav-item.active i{transform:translateY(-3px) scale(1.1)}
-.lang-selector{display:flex;gap:8px;margin-bottom:18px}
-.lang-btn{flex:1;padding:12px;border:2px solid rgba(0,0,0,.1);border-radius:14px;background:var(--card-bg);cursor:pointer;font-weight:700;font-size:13px;color:var(--text);transition:all .3s}
-.lang-btn.active{background:linear-gradient(135deg,var(--primary),var(--accent));color:#fff;border-color:transparent}
-.report-box{background:var(--card-bg);border-radius:24px;padding:22px;box-shadow:var(--shadow-sm)}
-@keyframes fadeIn{from{opacity:0}to{opacity:1}}
-@keyframes fadeInUp{from{opacity:0;transform:translateY(30px)}to{opacity:1;transform:translateY(0)}}
-@keyframes slideDown{from{opacity:0;transform:translateY(-30px)}to{opacity:1;transform:translateY(0)}}
-@keyframes slideIn{from{opacity:0;transform:translateX(-30px)}to{opacity:1;transform:translateX(0)}}
-@keyframes slideUp{from{transform:translateY(100%)}to{transform:translateY(0)}}
-@media(max-width:480px){.form-row{grid-template-columns:1fr}}
-</style>
-</head>
-<body>
-<canvas id="confetti-canvas"></canvas>
-<div id="toast" class="toast">OK</div>
 
-<div class="container">
-<div class="header">
-<div class="logo">
-<div class="logo-icon">💎</div>
-<div class="logo-text"><h1 data-i18n="appTitle">Qarz Daftar</h1><p data-i18n="appSubtitle">Premium Edition</p></div>
-</div>
-<div class="header-actions">
-<button class="icon-btn" onclick="toggleLang()"><i class="fas fa-language"></i></button>
-<button class="icon-btn" onclick="toggleTheme()"><i class="fas fa-moon" id="theme-icon"></i></button>
-</div>
-</div>
-
-<div id="page-home" class="page active">
-<div class="stats-grid">
-<div class="stat-card"><div class="stat-icon blue"><i class="fas fa-wallet"></i></div><div class="stat-label" data-i18n="totalGiven">Jami berilgan</div><div class="stat-value" id="total-given">0</div></div>
-<div class="stat-card"><div class="stat-icon orange"><i class="fas fa-clock"></i></div><div class="stat-label" data-i18n="remaining">Qolgan qarz</div><div class="stat-value" id="total-remaining">0</div></div>
-<div class="stat-card"><div class="stat-icon green"><i class="fas fa-check-circle"></i></div><div class="stat-label" data-i18n="paid">Tolangan</div><div class="stat-value" id="total-paid">0</div></div>
-<div class="stat-card"><div class="stat-icon purple"><i class="fas fa-users"></i></div><div class="stat-label" data-i18n="debtors">Qarzdorlar</div><div class="stat-value" id="total-count">0</div></div>
-</div>
-<button class="main-btn" onclick="openAddModal()"><i class="fas fa-plus-circle"></i><span data-i18n="addDebtor">Yangi qarzdor qo'shish</span></button>
-<div class="section-title"><i class="fas fa-list-ul"></i><span data-i18n="debtorList">Qarzdorlar ro'yxati</span></div>
-<div id="debtors-list"></div>
-</div>
-
-<div id="page-stats" class="page">
-<div class="section-title"><i class="fas fa-chart-pie"></i><span data-i18n="statistics">Statistika</span></div>
-<div class="chart-container"><canvas id="pieChart"></canvas></div>
-<div class="chart-container"><canvas id="barChart"></canvas></div>
-</div>
-
-<div id="page-report" class="page">
-<div class="section-title"><i class="fas fa-file-alt"></i><span data-i18n="reports">Hisobotlar</span></div>
-<div class="lang-selector">
-<button class="lang-btn active" onclick="setReportLang('uz',this)">🇺🇿 O'zbek</button>
-<button class="lang-btn" onclick="setReportLang('ru',this)">🇷🇺 Русский</button>
-<button class="lang-btn" onclick="setReportLang('en',this)">🇬🇧 English</button>
-</div>
-<button class="main-btn" onclick="generateReport()"><i class="fas fa-file-alt"></i><span data-i18n="generateReport">Hisobot yaratish</span></button>
-<div id="report-preview" class="report-box"></div>
-</div>
-</div>
-
-<div class="nav-bottom">
-<button class="nav-item active" onclick="switchPage('home',this)"><i class="fas fa-home"></i><span data-i18n="navHome">Bosh</span></button>
-<button class="nav-item" onclick="switchPage('stats',this)"><i class="fas fa-chart-pie"></i><span data-i18n="navStats">Stat</span></button>
-<button class="nav-item" onclick="switchPage('report',this)"><i class="fas fa-file-alt"></i><span data-i18n="navReport">Hisobot</span></button>
-</div>
-
-<div id="addModal" class="modal-overlay"><div class="modal-content">
-<div class="modal-header"><h2 class="modal-title" data-i18n="newDebtor">Yangi qarzdor</h2><button class="modal-close" onclick="closeModal('addModal')"><i class="fas fa-times"></i></button></div>
-<div class="form-group"><label class="form-label" data-i18n="name">Ism familiya *</label><input type="text" class="form-input" id="add-name" placeholder="Akramov Jasur"></div>
-<div class="form-row">
-<div class="form-group"><label class="form-label" data-i18n="phone">Telefon</label><input type="tel" class="form-input" id="add-phone" placeholder="+998..."></div>
-<div class="form-group"><label class="form-label" data-i18n="amount">Summa *</label><input type="number" class="form-input" id="add-amount" placeholder="1000000"></div>
-</div>
-<div class="form-row">
-<div class="form-group"><label class="form-label" data-i18n="dueDate">Muddat</label><input type="date" class="form-input" id="add-date"></div>
-<div class="form-group"><label class="form-label" data-i18n="category">Kategoriya</label><select class="form-input" id="add-category"><option>Shaxsiy</option><option>Biznes</option><option>Oila</option><option>Do'st</option></select></div>
-</div>
-<div class="form-group"><label class="form-label" data-i18n="note">Izoh</label><textarea class="form-input" id="add-note" rows="2"></textarea></div>
-<button class="btn-submit" onclick="addDebtor()"><i class="fas fa-check"></i> <span data-i18n="save">Saqlash</span></button>
-</div></div>
-
-<div id="payModal" class="modal-overlay"><div class="modal-content">
-<div class="modal-header"><h2 class="modal-title" data-i18n="addPayment">To'lov qo'shish</h2><button class="modal-close" onclick="closeModal('payModal')"><i class="fas fa-times"></i></button></div>
-<input type="hidden" id="pay-debtor-id">
-<div class="form-group"><label class="form-label" data-i18n="amount">Summa</label><input type="number" class="form-input" id="pay-amount"></div>
-<div class="form-group"><label class="form-label" data-i18n="note">Izoh</label><input type="text" class="form-input" id="pay-note"></div>
-<button class="btn-submit" onclick="addPayment()"><i class="fas fa-check"></i> <span data-i18n="confirm">Tasdiqlash</span></button>
-</div></div>
-
-<script>
-const tg=window.Telegram?.WebApp;
-if(tg){tg.ready();tg.expand()}
-const headers={'Content-Type':'application/json'};
-if(tg?.initData)headers['X-Telegram-Init-Data']=tg.initData;
-
-const translations={
-uz:{appTitle:"Qarz Daftar",appSubtitle:"Premium Edition",totalGiven:"Jami berilgan",remaining:"Qolgan qarz",paid:"Tolangan",debtors:"Qarzdorlar",addDebtor:"Yangi qarzdor qo'shish",debtorList:"Qarzdorlar ro'yxati",statistics:"Statistika",reports:"Hisobotlar",generateReport:"Hisobot yaratish",navHome:"Bosh",navStats:"Stat",navReport:"Hisobot",newDebtor:"Yangi qarzdor",name:"Ism familiya *",phone:"Telefon",amount:"Summa *",dueDate:"Muddat",category:"Kategoriya",note:"Izoh",save:"Saqlash",addPayment:"To'lov qo'shish",confirm:"Tasdiqlash",pay:"To'lov",delete:"O'chirish",noDebtors:"Hali qarzdor yo'q",tapAbove:"Yuqoridagi tugmani bosing",debtorAdded:"Qarzdor qo'shildi! ✨",paymentReceived:"To'lov qabul qilindi! 💰🎉",deleted:"O'chirildi! 🗑",confirmDelete:"O'chirishni tasdiqlaysizmi?",nameAmountRequired:"Ism va summa majburiy!",invalidAmount:"Noto'g'ri summa",total:"Jami",paidAmount:"Tolangan",statusActive:"Faol",statusOverdue:"Muddati o'tgan",statusPaid:"To'langan",reportTitle:"QARZ DAFTAR HISOBOTI",reportDate:"Sana",reportTotalDebtors:"Jami qarzdorlar",reportTotalGiven:"Jami berilgan",reportTotalPaid:"Tolangan",reportTotalRemaining:"Qolgan qarz",reportDebtorList:"Qarzdorlar ro'yxati"},
-ru:{appTitle:"Долговая Книга",appSubtitle:"Премиум",totalGiven:"Всего выдано",remaining:"Остаток",paid:"Оплачено",debtors:"Должники",addDebtor:"Добавить должника",debtorList:"Список должников",statistics:"Статистика",reports:"Отчёты",generateReport:"Создать отчёт",navHome:"Главная",navStats:"Стат",navReport:"Отчёт",newDebtor:"Новый должник",name:"Имя фамилия *",phone:"Телефон",amount:"Сумма *",dueDate:"Срок",category:"Категория",note:"Примечание",save:"Сохранить",addPayment:"Добавить платёж",confirm:"Подтвердить",pay:"Оплата",delete:"Удалить",noDebtors:"Пока нет должников",tapAbove:"Нажмите кнопку выше",debtorAdded:"Должник добавлен! ✨",paymentReceived:"Платёж принят! 💰",deleted:"Удалено! 🗑",confirmDelete:"Подтвердить удаление?",nameAmountRequired:"Имя и сумма обязательны!",invalidAmount:"Неверная сумма",total:"Всего",paidAmount:"Оплачено",statusActive:"Активен",statusOverdue:"Просрочен",statusPaid:"Оплачен",reportTitle:"ОТЧЁТ ДОЛГОВОЙ КНИГИ",reportDate:"Дата",reportTotalDebtors:"Всего должников",reportTotalGiven:"Всего выдано",reportTotalPaid:"Оплачено",reportTotalRemaining:"Остаток",reportDebtorList:"Список должников"},
-en:{appTitle:"Debt Book",appSubtitle:"Premium",totalGiven:"Total Given",remaining:"Remaining",paid:"Paid",debtors:"Debtors",addDebtor:"Add New Debtor",debtorList:"Debtors List",statistics:"Statistics",reports:"Reports",generateReport:"Generate Report",navHome:"Home",navStats:"Stats",navReport:"Report",newDebtor:"New Debtor",name:"Full Name *",phone:"Phone",amount:"Amount *",dueDate:"Due Date",category:"Category",note:"Note",save:"Save",addPayment:"Add Payment",confirm:"Confirm",pay:"Pay",delete:"Delete",noDebtors:"No debtors yet",tapAbove:"Tap the button above",debtorAdded:"Debtor added! ✨",paymentReceived:"Payment received! 💰🎉",deleted:"Deleted! 🗑",confirmDelete:"Confirm deletion?",nameAmountRequired:"Name and amount required!",invalidAmount:"Invalid amount",total:"Total",paidAmount:"Paid",statusActive:"Active",statusOverdue:"Overdue",statusPaid:"Paid",reportTitle:"DEBT BOOK REPORT",reportDate:"Date",reportTotalDebtors:"Total Debtors",reportTotalGiven:"Total Given",reportTotalPaid:"Total Paid",reportTotalRemaining:"Remaining",reportDebtorList:"Debtors List"}
-};
-
-let currentLang=localStorage.getItem('lang')||'uz';
-let reportLang='uz';
-let pieChart=null,barChart=null;
-
-function t(k){return translations[currentLang][k]||k}
-function updateTranslations(){document.querySelectorAll('[data-i18n]').forEach(el=>{el.textContent=t(el.getAttribute('data-i18n'))})}
-function toggleLang(){playClickSound();const L=['uz','ru','en'];currentLang=L[(L.indexOf(currentLang)+1)%3];localStorage.setItem('lang',currentLang);updateTranslations();loadData();showToast('🌐 '+currentLang.toUpperCase())}
-function setReportLang(l,btn){playClickSound();reportLang=l;document.querySelectorAll('.lang-btn').forEach(b=>b.classList.remove('active'));btn.classList.add('active');generateReport()}
-function switchPage(p,btn){playClickSound();document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'));document.getElementById('page-'+p).classList.add('active');document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));btn.classList.add('active');if(p==='stats')loadCharts();if(p==='report')generateReport()}
-
-function playSuccessSound(){try{const c=new (window.AudioContext||window.webkitAudioContext)();const o=c.createOscillator();const g=c.createGain();o.connect(g);g.connect(c.destination);o.frequency.setValueAtTime(523.25,c.currentTime);o.frequency.setValueAtTime(659.25,c.currentTime+0.1);o.frequency.setValueAtTime(783.99,c.currentTime+0.2);g.gain.setValueAtTime(0.3,c.currentTime);g.gain.exponentialRampToValueAtTime(0.01,c.currentTime+0.5);o.start(c.currentTime);o.stop(c.currentTime+0.5)}catch(e){}}
-function playClickSound(){try{const c=new (window.AudioContext||window.webkitAudioContext)();const o=c.createOscillator();const g=c.createGain();o.connect(g);g.connect(c.destination);o.frequency.setValueAtTime(800,c.currentTime);g.gain.setValueAtTime(0.2,c.currentTime);g.gain.exponentialRampToValueAtTime(0.01,c.currentTime+0.1);o.start(c.currentTime);o.stop(c.currentTime+0.1)}catch(e){}}
-
-function launchConfetti(){const cv=document.getElementById('confetti-canvas');const ctx=cv.getContext('2d');cv.width=innerWidth;cv.height=innerHeight;const ps=[];const cols=['#667eea','#f093fb','#10b981','#f59e0b','#ef4444'];for(let i=0;i<100;i++){ps.push({x:cv.width/2,y:cv.height/2,vx:(Math.random()-.5)*20,vy:(Math.random()-.5)*20-10,color:cols[Math.floor(Math.random()*cols.length)],size:Math.random()*8+4,life:1})}function an(){ctx.clearRect(0,0,cv.width,cv.height);ps.forEach((p,i)=>{p.x+=p.vx;p.y+=p.vy;p.vy+=0.5;p.life-=0.02;ctx.fillStyle=p.color;ctx.globalAlpha=p.life;ctx.fillRect(p.x,p.y,p.size,p.size);if(p.life<=0)ps.splice(i,1)});if(ps.length>0)requestAnimationFrame(an)}an()}
-
-function formatMoney(a){return new Intl.NumberFormat('uz-UZ').format(a||0)+" so'm"}
-function showToast(m,e){const t2=document.getElementById('toast');t2.textContent=m;t2.className='toast show'+(e?' error':'');setTimeout(()=>t2.classList.remove('show'),3000)}
-function toggleTheme(){playClickSound();const b=document.body;const d=b.getAttribute('data-theme')==='dark';b.setAttribute('data-theme',d?'light':'dark');localStorage.setItem('theme',d?'light':'dark');document.getElementById('theme-icon').className=d?'fas fa-moon':'fas fa-sun'}
-
-async function loadData(){
-try{
-const s=await (await fetch('/api/stats',{headers})).json();
-document.getElementById('total-given').textContent=formatMoney(s.total_given);
-document.getElementById('total-remaining').textContent=formatMoney(s.total_remaining);
-document.getElementById('total-paid').textContent=formatMoney(s.total_paid);
-document.getElementById('total-count').textContent=s.total_debtors;
-const ds=await (await fetch('/api/debtors',{headers})).json();
-const list=document.getElementById('debtors-list');
-if(!ds.length){list.innerHTML='<div class="empty-state"><div class="empty-icon"><i class="fas fa-inbox"></i></div><p style="font-size:17px;font-weight:600">'+t('noDebtors')+'</p><p style="font-size:13px;margin-top:6px;opacity:.7">'+t('tapAbove')+'</p></div>';return}
-list.innerHTML=ds.map((d,i)=>{
-const sc=d.status==='OVERDUE'?'overdue':d.status==='PAID'?'paid':'';
-const bc=d.status==='OVERDUE'?'badge-overdue':d.status==='PAID'?'badge-paid':'badge-active';
-const st=d.status==='OVERDUE'?t('statusOverdue'):d.status==='PAID'?t('statusPaid'):t('statusActive');
-return '<div class="debtor-card '+sc+'" style="animation-delay:'+(i*0.05)+'s"><div class="debtor-header"><div class="debtor-name">'+d.name+'</div><div class="debtor-amount">'+formatMoney(d.remaining_amount)+'</div></div><div class="debtor-info"><span><i class="fas fa-tag"></i>'+d.category+'</span>'+(d.due_date?'<span><i class="fas fa-calendar"></i>'+d.due_date+'</span>':'')+'</div><span class="debtor-badge '+bc+'">'+st+'</span><div class="debtor-details"><strong>'+t('total')+':</strong> '+formatMoney(d.total_amount)+' | <strong>'+t('paidAmount')+':</strong> '+formatMoney(d.paid_amount)+'</div><div class="debtor-actions">'+(d.status!=='PAID'?'<button class="btn-action btn-pay" onclick="openPayModal('+d.id+','+d.remaining_amount+')"><i class="fas fa-money-bill-wave"></i>'+t('pay')+'</button>':'')+'<button class="btn-action btn-delete" onclick="deleteDebtor('+d.id+')"><i class="fas fa-trash"></i>'+t('delete')+'</button></div></div>'}).join('');
-}catch(e){console.error(e);showToast('Xato: '+e.message,true)}'+(d.phone?'<a href=\"tel:'+d.phone.replace(/[^+0-9]/g,'')+'\" style=\"color:var(--primary);text-decoration:none;font-weight:600\"><i class=\"fas fa-phone\"></i> '+d.phone+'</a>':'<span style=\"color:var(--text-light)\"><i class=\"fas fa-phone\"></i> -</span>')+'
-}
-
-async function loadCharts(){
-try{
-const s=await (await fetch('/api/stats',{headers})).json();
-const ds=await (await fetch('/api/debtors',{headers})).json();
-if(pieChart)pieChart.destroy();
-pieChart=new Chart(document.getElementById('pieChart'),{type:'doughnut',data:{labels:[t('paid'),t('remaining')],datasets:[{data:[s.total_paid,s.total_remaining],backgroundColor:['#10b981','#ef4444'],borderWidth:0}]},options:{responsive:true,plugins:{legend:{position:'bottom'}}}});
-if(barChart)barChart.destroy();
-const top=ds.slice(0,5);
-barChart=new Chart(document.getElementById('barChart'),{type:'bar',data:{labels:top.map(d=>d.name),datasets:[{label:t('remaining'),data:top.map(d=>d.remaining_amount),backgroundColor:'rgba(102,126,234,0.8)',borderRadius:8}]},options:{responsive:true,plugins:{legend:{display:false}},scales:{y:{beginAtZero:true}}}});
-}catch(e){console.error(e)}
-}
-
-async function generateReport(){
-try{
-const s=await (await fetch('/api/stats',{headers})).json();
-const ds=await (await fetch('/api/debtors',{headers})).json();
-const tr=translations[reportLang];
-const today=new Date().toLocaleDateString();
-let h='<h2 style="text-align:center;margin-bottom:14px;color:var(--primary)">'+tr.reportTitle+'</h2><p style="text-align:center;margin-bottom:20px;color:var(--text-light)">'+tr.reportDate+': '+today+'</p><div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:20px"><div style="padding:14px;background:rgba(102,126,234,.1);border-radius:12px"><div style="font-size:11px;color:var(--text-light)">'+tr.reportTotalDebtors+'</div><div style="font-size:18px;font-weight:800">'+s.total_debtors+'</div></div><div style="padding:14px;background:rgba(16,185,129,.1);border-radius:12px"><div style="font-size:11px;color:var(--text-light)">'+tr.reportTotalGiven+'</div><div style="font-size:18px;font-weight:800">'+formatMoney(s.total_given)+'</div></div><div style="padding:14px;background:rgba(245,158,11,.1);border-radius:12px"><div style="font-size:11px;color:var(--text-light)">'+tr.reportTotalPaid+'</div><div style="font-size:18px;font-weight:800">'+formatMoney(s.total_paid)+'</div></div><div style="padding:14px;background:rgba(239,68,68,.1);border-radius:12px"><div style="font-size:11px;color:var(--text-light)">'+tr.reportTotalRemaining+'</div><div style="font-size:18px;font-weight:800">'+formatMoney(s.total_remaining)+'</div></div></div><h3 style="margin-bottom:10px">'+tr.reportDebtorList+'</h3>';
-if(!ds.length){h+='<p style="text-align:center;color:var(--text-light);padding:30px">'+t('noDebtors')+'</p>'}
-else{h+=ds.map(d=>'<div style="padding:12px;background:rgba(0,0,0,.03);border-radius:10px;margin-bottom:8px"><div style="display:flex;justify-content:space-between;margin-bottom:4px"><strong>'+d.name+'</strong><strong style="color:var(--primary)">'+formatMoney(d.remaining_amount)+'</strong></div><div style="font-size:12px;color:var(--text-light)">'+(d.phone||'-')+' | '+d.category+' | '+d.status+'</div></div>').join('')}
-document.getElementById('report-preview').innerHTML=h;
-}catch(e){console.error(e)}
-}
-
-function openAddModal(){playClickSound();document.getElementById('addModal').classList.add('active')}
-function closeModal(id){playClickSound();document.getElementById(id).classList.remove('active')}
-
-async function addDebtor(){
-const data={name:document.getElementById('add-name').value.trim(),phone:document.getElementById('add-phone').value.trim(),amount:parseFloat(document.getElementById('add-amount').value),due_date:document.getElementById('add-date').value||null,category:document.getElementById('add-category').value,note:document.getElementById('add-note').value.trim()};
-if(!data.name||!data.amount){showToast(t('nameAmountRequired'),true);return}
-try{
-const r=await fetch('/api/debtors',{method:'POST',headers,body:JSON.stringify(data)});
-if(!r.ok)throw new Error('Add error');
-playSuccessSound();showToast(t('debtorAdded'));closeModal('addModal');
-['add-name','add-phone','add-amount','add-date','add-note'].forEach(id=>document.getElementById(id).value='');
-loadData();
-}catch(e){showToast('Xato: '+e.message,true)}
-}
-
-function openPayModal(id,rem){playClickSound();document.getElementById('pay-debtor-id').value=id;document.getElementById('pay-amount').value=rem;document.getElementById('pay-note').value='';document.getElementById('payModal').classList.add('active')}
-
-async function addPayment(){
-const id=document.getElementById('pay-debtor-id').value;
-const amount=parseFloat(document.getElementById('pay-amount').value);
-const note=document.getElementById('pay-note').value.trim();
-if(!amount||amount<=0){showToast(t('invalidAmount'),true);return}
-try{
-const r=await fetch('/api/debtors/'+id+'/pay',{method:'PUT',headers,body:JSON.stringify({amount,note})});
-if(!r.ok)throw new Error('Pay error');
-playSuccessSound();launchConfetti();showToast(t('paymentReceived'));closeModal('payModal');loadData();
-}catch(e){showToast('Xato: '+e.message,true)}
-}
-
-async function deleteDebtor(id){
-if(!confirm(t('confirmDelete')))return;
-try{
-const r=await fetch('/api/debtors/'+id,{method:'DELETE',headers});
-if(!r.ok)throw new Error('Del error');
-playClickSound();showToast(t('deleted'));loadData();
-}catch(e){showToast('Xato: '+e.message,true)}
-}
-
-window.onload=()=>{
-const th=localStorage.getItem('theme')||'light';
-document.body.setAttribute('data-theme',th);
-document.getElementById('theme-icon').className=th==='dark'?'fas fa-sun':'fas fa-moon';
-updateTranslations();loadData();
-};
-</script>
-</body>
-</html>"""
+# ============ SOZLAMALAR (PIN) ============
+@app.get("/api/settings")
+async def get_settings(user: dict = Depends(get_current_user)):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT pin_code, language, theme FROM settings WHERE user_id=?", (user["telegram_id"],))
+        row = await cur.fetchone()
+        if not row:
+            return {"pin_set": False, "language": "uz", "theme": "light"}
+        return {"pin_set": bool(row[0]), "language": row[1] or "uz", "theme": row[2] or "light"}
 
 
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    return HTMLResponse(HTML_TEMPLATE)
+@app.post("/api/settings/pin")
+async def set_pin(data: PinSet, user: dict = Depends(get_current_user)):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR REPLACE INTO settings (user_id, pin_code) VALUES (?, ?)",
+                         (user["telegram_id"], data.pin))
+        await db.commit()
+    return {"ok": True, "pin_set": bool(data.pin)}
 
 
+# ============ STATISTIKA ============
 @app.get("/api/stats")
 async def get_stats(user: dict = Depends(get_current_user)):
+    rates = await get_currency_rates()
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cur = await db.execute("""
-            SELECT COUNT(*) as total_debtors,
-                   COALESCE(SUM(total_amount),0) as total_given,
-                   COALESCE(SUM(paid_amount),0) as total_paid,
-                   COALESCE(SUM(remaining_amount),0) as total_remaining
-            FROM debtors WHERE user_id=?
-        """, (user["telegram_id"],))
-        return dict(await cur.fetchone())
+        cur = await db.execute("SELECT * FROM debtors WHERE user_id=?", (user["telegram_id"],))
+        rows = [dict(r) for r in await cur.fetchall()]
+    total_given = total_paid = total_rem = 0
+    for d in rows:
+        c = d.get("currency", "UZS") or "UZS"
+        total_given += convert_amount(d["total_amount"], c, "UZS", rates)
+        total_paid += convert_amount(d["paid_amount"], c, "UZS", rates)
+        total_rem += convert_amount(d["remaining_amount"], c, "UZS", rates)
+    return {"total_debtors": len(rows), "total_given": total_given, "total_paid": total_paid,
+            "total_remaining": total_rem, "rates": rates}
 
 
 @app.get("/api/debtors")
@@ -470,13 +231,38 @@ async def get_debtors(user: dict = Depends(get_current_user)):
         return [dict(r) for r in await cur.fetchall()]
 
 
+@app.get("/api/debtors/top")
+async def top_debtors(user: dict = Depends(get_current_user)):
+    rates = await get_currency_rates()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM debtors WHERE user_id=? AND remaining_amount>0 ORDER BY remaining_amount DESC LIMIT 10", (user["telegram_id"],))
+        rows = [dict(r) for r in await cur.fetchall()]
+    for d in rows:
+        c = d.get("currency", "UZS") or "UZS"
+        d["remaining_uzs"] = convert_amount(d["remaining_amount"], c, "UZS", rates)
+    rows.sort(key=lambda x: x["remaining_uzs"], reverse=True)
+    return rows[:10]
+
+
+@app.get("/api/payments/{debtor_id}")
+async def get_payments(debtor_id: int, user: dict = Depends(get_current_user)):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("""
+            SELECT p.* FROM payments p JOIN debtors d ON p.debtor_id=d.id
+            WHERE p.debtor_id=? AND d.user_id=? ORDER BY p.payment_date DESC
+        """, (debtor_id, user["telegram_id"]))
+        return [dict(r) for r in await cur.fetchall()]
+
+
 @app.post("/api/debtors")
 async def create_debtor(d: DebtorCreate, user: dict = Depends(get_current_user)):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("""
-            INSERT INTO debtors (user_id,name,phone,category,note,total_amount,paid_amount,remaining_amount,due_date)
-            VALUES (?,?,?,?,?,?,0,?,?)
-        """, (user["telegram_id"], d.name, d.phone, d.category, d.note, d.amount, d.amount, d.due_date))
+            INSERT INTO debtors (user_id,name,phone,category,note,total_amount,paid_amount,remaining_amount,currency,rating,due_date)
+            VALUES (?,?,?,?,?,?,0,?,?,?,?,?)
+        """, (user["telegram_id"], d.name, d.phone, d.category, d.note, d.amount, d.amount, d.currency, d.rating, d.due_date))
         await db.commit()
         return {"id": cur.lastrowid}
 
@@ -487,9 +273,9 @@ async def add_payment(debtor_id: int, p: PaymentCreate, user: dict = Depends(get
         cur = await db.execute("SELECT total_amount,paid_amount,remaining_amount FROM debtors WHERE id=? AND user_id=?", (debtor_id, user["telegram_id"]))
         row = await cur.fetchone()
         if not row:
-            raise HTTPException(404, "Topilmadi")
+            raise HTTPException(404)
         if p.amount <= 0 or p.amount > row[2]:
-            raise HTTPException(400, "Summa xato")
+            raise HTTPException(400)
         new_paid = row[1] + p.amount
         new_rem = row[2] - p.amount
         new_status = "PAID" if new_rem == 0 else "ACTIVE"
@@ -499,48 +285,501 @@ async def add_payment(debtor_id: int, p: PaymentCreate, user: dict = Depends(get
         return {"remaining": new_rem, "status": new_status}
 
 
+@app.put("/api/debtors/{debtor_id}/rating")
+async def set_rating(debtor_id: int, rating: int, user: dict = Depends(get_current_user)):
+    if not 1 <= rating <= 5:
+        raise HTTPException(400)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE debtors SET rating=? WHERE id=? AND user_id=?", (rating, debtor_id, user["telegram_id"]))
+        await db.commit()
+    return {"ok": True}
+
+
 @app.delete("/api/debtors/{debtor_id}")
 async def delete_debtor(debtor_id: int, user: dict = Depends(get_current_user)):
     async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT image_path FROM debtors WHERE id=? AND user_id=?", (debtor_id, user["telegram_id"]))
+        row = await cur.fetchone()
+        if row and row[0] and os.path.exists(row[0]):
+            os.remove(row[0])
         await db.execute("DELETE FROM payments WHERE debtor_id=?", (debtor_id,))
         await db.execute("DELETE FROM debtors WHERE id=? AND user_id=?", (debtor_id, user["telegram_id"]))
         await db.commit()
-        return {"ok": True}
+    return {"ok": True}
 
 
+# ============ RASM YUKLASH ============
+@app.post("/api/debtors/{debtor_id}/image")
+async def upload_image(debtor_id: int, file: UploadFile = File(...), user: dict = Depends(get_current_user)):
+    ext = file.filename.split(".")[-1].lower() if file.filename else "jpg"
+    if ext not in ["jpg", "jpeg", "png", "webp"]:
+        ext = "jpg"
+    path = os.path.join(IMAGES_DIR, f"{user['telegram_id']}_{debtor_id}_{int(datetime.now().timestamp())}.{ext}")
+    content = await file.read()
+    with open(path, "wb") as f:
+        f.write(content)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE debtors SET image_path=? WHERE id=? AND user_id=?", (path, debtor_id, user["telegram_id"]))
+        await db.commit()
+    return {"ok": True, "url": f"/images/{os.path.basename(path)}"}
+
+
+@app.get("/images/{filename}")
+async def serve_image(filename: str):
+    path = os.path.join(IMAGES_DIR, filename)
+    if not os.path.exists(path):
+        raise HTTPException(404)
+    return Response(open(path, "rb").read(), media_type="image/jpeg")
+
+
+# ============ PDF HISOBOT ============
+@app.get("/api/export/pdf")
+async def export_pdf(user: dict = Depends(get_current_user), lang: str = "uz"):
+    rates = await get_currency_rates()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT COUNT(*) n, COALESCE(SUM(total_amount),0) g, COALESCE(SUM(paid_amount),0) p, COALESCE(SUM(remaining_amount),0) r FROM debtors WHERE user_id=?", (user["telegram_id"],))
+        s = dict(await cur.fetchone())
+        cur = await db.execute("SELECT name,phone,total_amount,paid_amount,remaining_amount,currency,status,rating,due_date FROM debtors WHERE user_id=? ORDER BY remaining_amount DESC", (user["telegram_id"],))
+        debtors = [dict(r) for r in await cur.fetchall()]
+
+    tr = {
+        "uz": {"title": "QARZ DAFTAR HISOBOTI", "date": "Sana", "debtors": "Qarzdorlar", "given": "Berilgan", "paid": "Tolangan", "rem": "Qolgan", "list": "Qarzdorlar ro'yxati", "name": "Ism", "phone": "Tel", "total": "Jami", "status": "Holat"},
+        "ru": {"title": "ОТЧЁТ ДОЛГОВОЙ КНИГИ", "date": "Дата", "debtors": "Должники", "given": "Выдано", "paid": "Оплачено", "rem": "Остаток", "list": "Список должников", "name": "Имя", "phone": "Тел", "total": "Всего", "status": "Статус"},
+        "en": {"title": "DEBT BOOK REPORT", "date": "Date", "debtors": "Debtors", "given": "Given", "paid": "Paid", "rem": "Remaining", "list": "Debtors List", "name": "Name", "phone": "Phone", "total": "Total", "status": "Status"}
+    }.get(lang, {"title": "REPORT", "date": "Date", "debtors": "Debtors", "given": "Given", "paid": "Paid", "rem": "Remaining", "list": "List", "name": "Name", "phone": "Phone", "total": "Total", "status": "Status"})
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, rightMargin=40, leftMargin=40, topMargin=40, bottomMargin=40)
+    styles = getSampleStyleSheet()
+    title_st = ParagraphStyle('T', parent=styles['Heading1'], fontSize=22, textColor=colors.HexColor('#667eea'), alignment=1, spaceAfter=16)
+    head_st = ParagraphStyle('H', parent=styles['Heading2'], fontSize=14, textColor=colors.HexColor('#764ba2'), spaceBefore=14, spaceAfter=10)
+    norm_st = ParagraphStyle('N', parent=styles['Normal'], fontSize=11, spaceAfter=4)
+
+    els = [Paragraph(tr["title"], title_st), Paragraph(f"{tr['date']}: {datetime.now().strftime('%d.%m.%Y %H:%M')}", norm_st), Spacer(1, 16)]
+
+    stats_data = [[tr["debtors"], tr["given"]+" (UZS)", tr["paid"]+" (UZS)", tr["rem"]+" (UZS)"],
+                  [str(s["n"]), f"{s['g']:,.0f}", f"{s['p']:,.0f}", f"{s['r']:,.0f}"]]
+    st_tbl = Table(stats_data, colWidths=[100, 150, 150, 150])
+    st_tbl.setStyle(TableStyle([('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#667eea')), ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+                                ('ALIGN', (0, 0), (-1, -1), 'CENTER'), ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'), ('FONTSIZE', (0, 0), (-1, 0), 11),
+                                ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#f8fafc')), ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')),
+                                ('FONTSIZE', (0, 1), (-1, -1), 12), ('TOPPADDING', (0, 0), (-1, -1), 8), ('BOTTOMPADDING', (0, 0), (-1, -1), 8)]))
+    els.append(st_tbl)
+    els.append(Spacer(1, 20))
+    els.append(Paragraph(tr["list"], head_st))
+
+    tbl_data = [[tr["name"], tr["phone"], tr["total"], tr["rem"], tr["status"]]]
+    for d in debtors:
+        c = d.get("currency", "UZS") or "UZS"
+        tbl_data.append([d["name"][:20], d["phone"] or "-", f"{d['total_amount']:,.0f} {c}", f"{d['remaining_amount']:,.0f}", d["status"]])
+
+    if len(tbl_data) > 1:
+        d_tbl = Table(tbl_data, colWidths=[140, 100, 110, 110, 80])
+        d_tbl.setStyle(TableStyle([('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#764ba2')), ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+                                   ('ALIGN', (2, 0), (-1, -1), 'RIGHT'), ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'), ('FONTSIZE', (0, 0), (-1, -1), 9),
+                                   ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#e5e7eb')), ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f8fafc')]),
+                                   ('TOPPADDING', (0, 0), (-1, -1), 6), ('BOTTOMPADDING', (0, 0), (-1, -1), 6)]))
+        els.append(d_tbl)
+    else:
+        els.append(Paragraph("—", norm_st))
+
+    doc.build(els)
+    buf.seek(0)
+    return StreamingResponse(buf, media_type="application/pdf", headers={"Content-Disposition": f"attachment; filename=qarz_hisobot_{lang}.pdf"})
+
+
+# ============ CSV ============
 @app.get("/api/export/csv")
 async def export_csv(user: dict = Depends(get_current_user)):
     async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT name,phone,total_amount,paid_amount,remaining_amount,status,due_date FROM debtors WHERE user_id=?", (user["telegram_id"],))
+        cur = await db.execute("SELECT name,phone,total_amount,currency,paid_amount,remaining_amount,status,rating,due_date FROM debtors WHERE user_id=?", (user["telegram_id"],))
         rows = await cur.fetchall()
-    lines = ["Ism;Telefon;Jami;Tolangan;Qolgan;Holat;Muddat"]
+    lines = ["Ism;Telefon;Jami;Valyuta;Tolangan;Qolgan;Holat;Reyting;Muddat"]
     for r in rows:
         lines.append(";".join("" if x is None else str(x) for x in r))
     return Response("\n".join(lines), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=qarzlar.csv"})
 
 
+# ============ ESLATMA MATNI ============
+@app.get("/api/remind/{debtor_id}")
+async def remind_text(debtor_id: int, user: dict = Depends(get_current_user)):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT name, remaining_amount, currency, due_date FROM debtors WHERE id=? AND user_id=?", (debtor_id, user["telegram_id"]))
+        d = await cur.fetchone()
+    if not d:
+        raise HTTPException(404)
+    c = d["currency"] or "UZS"
+    txt = (f"Assalomu alaykum, {d['name']}!\n\n"
+           f"Sizda {d['remaining_amount']:,.0f} {c} qarz bor.\n"
+           f"Iltimos, imkon qadar tezroq to'lang.\n\nRahmat! 🙏")
+    return {"text": txt, "phone": d["phone"]}
+
+
 @app.post("/webhook")
 async def webhook(request: Request):
     data = await request.json()
-    update = types.Update(**data)
-    await dp.feed_update(bot, update)
+    await dp.feed_update(bot, types.Update(**data))
     return {"ok": True}
+
+
+
+# ============ HTML ============
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="uz"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Qarz Daftar Pro</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+:root{--bg:linear-gradient(135deg,#667eea,#764ba2 50%,#f093fb);--card:rgba(255,255,255,.98);--pri:#667eea;--acc:#f093fb;--ok:#10b981;--err:#ef4444;--warn:#f59e0b;--txt:#1f2937;--mut:#6b7280;--sh:0 8px 32px rgba(0,0,0,.12);--glow:0 0 40px rgba(102,126,234,.4)}
+[data-theme=dark]{--bg:linear-gradient(135deg,#0f172a,#1e293b 50%,#312e81);--card:rgba(30,41,59,.98);--txt:#f8fafc;--mut:#94a3b8;--sh:0 8px 32px rgba(0,0,0,.3)}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg);min-height:100vh;color:var(--txt);padding:20px;padding-bottom:110px;overflow-x:hidden}
+body::before{content:'';position:fixed;inset:-50%;background:radial-gradient(circle at 20% 50%,rgba(102,126,234,.15),transparent 50%),radial-gradient(circle at 80% 80%,rgba(240,147,251,.15),transparent 50%);z-index:0;animation:bg 20s ease-in-out infinite}
+@keyframes bg{0%,100%{transform:translate(0,0)}33%{transform:translate(30px,-30px)}66%{transform:translate(-20px,20px)}}
+.container{max-width:600px;margin:0 auto;position:relative;z-index:1}
+.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:22px;animation:sd .6s cubic-bezier(.34,1.56,.64,1)}
+.logo{display:flex;align-items:center;gap:12px}
+.logo-icon{width:50px;height:50px;background:linear-gradient(135deg,var(--pri),var(--acc));border-radius:16px;display:flex;align-items:center;justify-content:center;font-size:24px;box-shadow:var(--glow);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.05)}}
+.logo-text h1{font-size:22px;font-weight:900;background:linear-gradient(135deg,var(--pri),var(--acc));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.logo-text p{font-size:11px;color:var(--mut)}
+.ha{display:flex;gap:8px}
+.ib{width:42px;height:42px;border-radius:50%;background:var(--card);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:17px;box-shadow:var(--sh);color:var(--txt);transition:.3s}
+.ib:active{transform:scale(.85) rotate(180deg)}
+.sg{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin-bottom:22px}
+.sc{background:var(--card);padding:18px;border-radius:22px;box-shadow:var(--sh);animation:fu .5s backwards}
+.sc:nth-child(1){animation-delay:.1s}.sc:nth-child(2){animation-delay:.2s}.sc:nth-child(3){animation-delay:.3s}.sc:nth-child(4){animation-delay:.4s}
+.sc:active{transform:scale(.95)}
+.si{width:46px;height:46px;border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:20px;margin-bottom:10px;color:#fff}
+.si.b{background:linear-gradient(135deg,#667eea,#764ba2)}.si.g{background:linear-gradient(135deg,#10b981,#059669)}.si.o{background:linear-gradient(135deg,#f59e0b,#d97706)}.si.p{background:linear-gradient(135deg,#8b5cf6,#7c3aed)}
+.sl{font-size:11px;color:var(--mut);font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+.sv{font-size:20px;font-weight:900;margin-top:2px}
+.mb{width:100%;padding:17px;background:linear-gradient(135deg,var(--pri),var(--acc));border:none;border-radius:20px;color:#fff;font-size:16px;font-weight:800;cursor:pointer;margin-bottom:22px;box-shadow:0 12px 40px rgba(102,126,234,.5);display:flex;align-items:center;justify-content:center;gap:10px}
+.mb:active{transform:scale(.95)}
+.st{font-size:18px;font-weight:800;margin-bottom:14px;display:flex;align-items:center;gap:8px}
+.st i{color:var(--pri)}
+.dc{background:var(--card);padding:18px;border-radius:22px;margin-bottom:14px;box-shadow:var(--sh);position:relative;overflow:hidden;animation:si .4s cubic-bezier(.34,1.56,.64,1) backwards}
+.dc::before{content:'';position:absolute;left:0;top:0;bottom:0;width:5px;background:linear-gradient(180deg,var(--pri),var(--acc))}
+.dc.overdue::before{background:linear-gradient(180deg,var(--err),#dc2626)}.dc.paid::before{background:linear-gradient(180deg,var(--ok),#059669)}
+.dh{display:flex;justify-content:space-between;align-items:start;margin-bottom:10px}
+.dn{font-size:17px;font-weight:800}
+.da{font-size:18px;font-weight:900;background:linear-gradient(135deg,var(--pri),var(--acc));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.di{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:10px;font-size:12px;color:var(--mut)}
+.di span{display:flex;align-items:center;gap:5px}.di i{color:var(--pri)}
+.di a{color:var(--pri);text-decoration:none;font-weight:600}
+.badge{display:inline-block;padding:5px 11px;border-radius:18px;font-size:10px;font-weight:700;margin-bottom:10px;text-transform:uppercase}
+.ba{background:rgba(102,126,234,.15);color:var(--pri)}.bo{background:rgba(239,68,68,.15);color:var(--err)}.bp{background:rgba(16,185,129,.15);color:var(--ok)}
+.dd{font-size:11px;color:var(--mut);margin-bottom:12px;padding:9px;background:rgba(0,0,0,.03);border-radius:10px}
+.rat{color:#f59e0b;font-size:14px;cursor:pointer;letter-spacing:2px}
+.dac{display:flex;gap:8px;flex-wrap:wrap}
+.ba2{flex:1;min-width:80px;padding:11px;border:none;border-radius:12px;font-size:13px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;transition:.3s}
+.ba2:active{transform:scale(.9)}
+.bpay{background:linear-gradient(135deg,var(--ok),#059669);color:#fff}
+.bwa{background:#25D366;color:#fff}.brem{background:linear-gradient(135deg,#3b82f6,#2563eb);color:#fff}
+.bdel{background:rgba(239,68,68,.15);color:var(--err)}
+.bhist{background:rgba(139,92,246,.15);color:#8b5cf6}
+.es{text-align:center;padding:50px 20px;color:var(--mut)}
+.ei{font-size:60px;margin-bottom:14px;opacity:.2;animation:fl 3s infinite}
+@keyframes fl{0%,100%{transform:translateY(0)}50%{transform:translateY(-20px)}}
+.mo{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);backdrop-filter:blur(12px);z-index:1000;align-items:flex-end;justify-content:center}
+.mo.ac{display:flex;animation:fi .3s}
+.mc{background:var(--card);width:100%;max-width:600px;border-radius:30px 30px 0 0;padding:28px 22px;max-height:90vh;overflow-y:auto;animation:su .4s cubic-bezier(.34,1.56,.64,1)}
+.mh{display:flex;justify-content:space-between;align-items:center;margin-bottom:22px}
+.mt{font-size:22px;font-weight:900;background:linear-gradient(135deg,var(--pri),var(--acc));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.mx{width:36px;height:36px;border-radius:50%;background:rgba(0,0,0,.1);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:17px;color:var(--txt)}
+.fg{margin-bottom:18px}
+.fl{display:block;font-size:12px;font-weight:700;margin-bottom:7px;text-transform:uppercase;letter-spacing:.5px}
+.fi{width:100%;padding:14px;border:2px solid rgba(0,0,0,.1);border-radius:14px;font-size:15px;background:rgba(0,0,0,.03);color:var(--txt)}
+.fi:focus{outline:none;border-color:var(--pri);box-shadow:0 0 0 4px rgba(102,126,234,.15)}
+.fr{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.bs{width:100%;padding:16px;background:linear-gradient(135deg,var(--pri),var(--acc));border:none;border-radius:16px;color:#fff;font-size:16px;font-weight:800;cursor:pointer;margin-top:6px}
+.bs:active{transform:scale(.95)}
+.toast{position:fixed;top:28px;left:50%;transform:translateX(-50%) translateY(-150px);background:linear-gradient(135deg,var(--ok),#059669);color:#fff;padding:14px 28px;border-radius:28px;font-weight:700;font-size:14px;box-shadow:0 15px 40px rgba(0,0,0,.3);z-index:2000;opacity:0;transition:.4s cubic-bezier(.34,1.56,.64,1)}
+.toast.sh{opacity:1;transform:translateX(-50%) translateY(0)}.toast.er{background:linear-gradient(135deg,var(--err),#dc2626)}
+#cc{position:fixed;inset:0;pointer-events:none;z-index:1500}
+.page{display:none}.page.ac{display:block;animation:fi .3s}
+.cc{background:var(--card);border-radius:22px;padding:18px;margin-bottom:18px;box-shadow:var(--sh)}
+.nb{position:fixed;bottom:0;left:0;right:0;background:var(--card);backdrop-filter:blur(20px);display:flex;justify-content:space-around;padding:8px 0 calc(8px + env(safe-area-inset-bottom));box-shadow:0 -8px 32px rgba(0,0,0,.1);z-index:100}
+.ni{display:flex;flex-direction:column;align-items:center;gap:3px;padding:5px 12px;border:none;background:none;cursor:pointer;color:var(--mut);font-size:10px;font-weight:600}
+.ni i{font-size:18px;transition:.3s}.ni.ac{color:var(--pri)}.ni.ac i{transform:translateY(-3px) scale(1.1)}
+.ls{display:flex;gap:7px;margin-bottom:16px}
+.lb{flex:1;padding:11px;border:2px solid rgba(0,0,0,.1);border-radius:12px;background:var(--card);cursor:pointer;font-weight:700;font-size:12px;color:var(--txt)}
+.lb.ac{background:linear-gradient(135deg,var(--pri),var(--acc));color:#fff;border-color:transparent}
+.rb{background:var(--card);border-radius:22px;padding:20px;box-shadow:var(--sh)}
+.pin-screen{position:fixed;inset:0;background:var(--bg);z-index:3000;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:30px}
+.pin-box{background:var(--card);padding:40px 30px;border-radius:28px;box-shadow:var(--sh);text-align:center;width:100%;max-width:340px}
+.pin-title{font-size:22px;font-weight:900;margin-bottom:8px;background:linear-gradient(135deg,var(--pri),var(--acc));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.pin-sub{color:var(--mut);font-size:13px;margin-bottom:24px}
+.pin-dots{display:flex;gap:14px;justify-content:center;margin-bottom:28px}
+.pin-dot{width:16px;height:16px;border-radius:50%;background:rgba(0,0,0,.1);transition:.2s}
+.pin-dot.filled{background:var(--pri);transform:scale(1.2)}
+.pin-pad{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+.pin-key{padding:18px;border:none;border-radius:16px;background:rgba(0,0,0,.04);font-size:22px;font-weight:700;cursor:pointer;color:var(--txt)}
+.pin-key:active{background:var(--pri);color:#fff}
+.pin-key.fn{background:transparent;font-size:16px}
+.pay-item{padding:12px;background:rgba(0,0,0,.03);border-radius:12px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}
+.cur-sel{display:flex;gap:6px;margin-bottom:14px}
+.cur-btn{flex:1;padding:10px;border:2px solid rgba(0,0,0,.1);border-radius:12px;background:var(--card);cursor:pointer;font-weight:700;font-size:13px;color:var(--txt)}
+.cur-btn.ac{background:linear-gradient(135deg,var(--pri),var(--acc));color:#fff;border-color:transparent}
+@keyframes fi{from{opacity:0}to{opacity:1}}
+@keyframes fu{from{opacity:0;transform:translateY(30px)}to{opacity:1;transform:translateY(0)}}
+@keyframes sd{from{opacity:0;transform:translateY(-30px)}to{opacity:1;transform:translateY(0)}}
+@keyframes si{from{opacity:0;transform:translateX(-30px)}to{opacity:1;transform:translateX(0)}}
+@keyframes su{from{transform:translateY(100%)}to{transform:translateY(0)}}
+@media(max-width:480px){.fr{grid-template-columns:1fr}.sv{font-size:18px}}
+</style></head>
+<body>
+<canvas id="cc"></canvas>
+<div id="toast" class="toast">OK</div>
+
+<div id="pinScreen" class="pin-screen" style="display:none">
+<div class="pin-box">
+<div class="pin-title">🔐 PIN</div>
+<div class="pin-sub" id="pinSub">Kirish uchun PIN kiriting</div>
+<div class="pin-dots" id="pinDots"><div class="pin-dot"></div><div class="pin-dot"></div><div class="pin-dot"></div><div class="pin-dot"></div></div>
+<div class="pin-pad">
+<button class="pin-key" onclick="pinKey('1')">1</button><button class="pin-key" onclick="pinKey('2')">2</button><button class="pin-key" onclick="pinKey('3')">3</button>
+<button class="pin-key" onclick="pinKey('4')">4</button><button class="pin-key" onclick="pinKey('5')">5</button><button class="pin-key" onclick="pinKey('6')">6</button>
+<button class="pin-key" onclick="pinKey('7')">7</button><button class="pin-key" onclick="pinKey('8')">8</button><button class="pin-key" onclick="pinKey('9')">9</button>
+<button class="pin-key fn" onclick="pinClear()">C</button><button class="pin-key" onclick="pinKey('0')">0</button><button class="pin-key fn" onclick="pinDel()">⌫</button>
+</div>
+</div>
+</div>
+
+<div class="container" id="mainApp" style="display:none">
+<div class="header">
+<div class="logo"><div class="logo-icon">💎</div><div class="logo-text"><h1 data-i18n="appTitle">Qarz Daftar</h1><p data-i18n="appSubtitle">Pro Edition</p></div></div>
+<div class="ha">
+<button class="ib" onclick="toggleLang()"><i class="fas fa-language"></i></button>
+<button class="ib" onclick="toggleTheme()"><i class="fas fa-moon" id="ti"></i></button>
+</div>
+</div>
+
+<div id="page-home" class="page ac">
+<div class="sg">
+<div class="sc"><div class="si b"><i class="fas fa-wallet"></i></div><div class="sl" data-i18n="totalGiven">Jami berilgan</div><div class="sv" id="tg">0</div></div>
+<div class="sc"><div class="si o"><i class="fas fa-clock"></i></div><div class="sl" data-i18n="remaining">Qolgan</div><div class="sv" id="tr">0</div></div>
+<div class="sc"><div class="si g"><i class="fas fa-check-circle"></i></div><div class="sl" data-i18n="paid">Tolangan</div><div class="sv" id="tp">0</div></div>
+<div class="sc"><div class="si p"><i class="fas fa-users"></i></div><div class="sl" data-i18n="debtors">Qarzdorlar</div><div class="sv" id="tc">0</div></div>
+</div>
+<button class="mb" onclick="openAdd()"><i class="fas fa-plus-circle"></i><span data-i18n="addDebtor">Yangi qarzdor</span></button>
+<div class="st"><i class="fas fa-list-ul"></i><span data-i18n="debtorList">Qarzdorlar</span></div>
+<div id="dl"></div>
+</div>
+
+<div id="page-top" class="page">
+<div class="st"><i class="fas fa-trophy"></i><span data-i18n="topDebtors">TOP Qarzdorlar</span></div>
+<div id="topList"></div>
+</div>
+
+<div id="page-stats" class="page">
+<div class="st"><i class="fas fa-chart-pie"></i><span data-i18n="statistics">Statistika</span></div>
+<div class="cc"><canvas id="pie"></canvas></div>
+<div class="cc"><canvas id="bar"></canvas></div>
+</div>
+
+<div id="page-report" class="page">
+<div class="st"><i class="fas fa-file-pdf"></i><span data-i18n="reports">Hisobotlar</span></div>
+<div class="ls">
+<button class="lb ac" onclick="setRL('uz',this)">🇺🇿 O'zbek</button>
+<button class="lb" onclick="setRL('ru',this)">🇷🇺 Рус</button>
+<button class="lb" onclick="setRL('en',this)">🇬 EN</button>
+</div>
+<button class="mb" onclick="downloadPDF()"><i class="fas fa-download"></i><span data-i18n="downloadPdf">PDF yuklab olish</span></button>
+<button class="mb" style="background:linear-gradient(135deg,#10b981,#059669)" onclick="downloadCSV()"><i class="fas fa-file-csv"></i><span>CSV yuklab olish</span></button>
+</div>
+
+<div id="page-settings" class="page">
+<div class="st"><i class="fas fa-cog"></i><span data-i18n="settings">Sozlamalar</span></div>
+<div class="cc">
+<h3 style="margin-bottom:12px">🔐 PIN kod</h3>
+<p style="font-size:13px;color:var(--mut);margin-bottom:14px" data-i18n="pinDesc">Ilovani himoyalash uchun 4 xonali PIN</p>
+<div id="pinStatus" style="margin-bottom:12px;font-weight:700"></div>
+<button class="bs" onclick="changePin()" data-i18n="setPin">PIN o'rnatish</button>
+<button class="bs" style="background:linear-gradient(135deg,#ef4444,#dc2626);margin-top:8px" onclick="removePin()" data-i18n="removePin">PIN o'chirish</button>
+</div>
+<div class="cc">
+<h3 style="margin-bottom:12px">💱 Valyuta kurslari</h3>
+<div id="ratesBox" style="font-size:14px"></div>
+<p style="font-size:11px;color:var(--mut);margin-top:10px">Kurslar har kuni avtomatik yangilanadi</p>
+</div>
+</div>
+</div>
+
+<div class="nb">
+<button class="ni ac" onclick="sw('home',this)"><i class="fas fa-home"></i><span data-i18n="navHome">Bosh</span></button>
+<button class="ni" onclick="sw('top',this)"><i class="fas fa-trophy"></i><span data-i18n="navTop">TOP</span></button>
+<button class="ni" onclick="sw('stats',this)"><i class="fas fa-chart-pie"></i><span data-i18n="navStats">Stat</span></button>
+<button class="ni" onclick="sw('report',this)"><i class="fas fa-file-pdf"></i><span data-i18n="navReport">PDF</span></button>
+<button class="ni" onclick="sw('settings',this)"><i class="fas fa-cog"></i><span data-i18n="navSettings">⚙️</span></button>
+</div>
+
+<div id="addM" class="mo"><div class="mc">
+<div class="mh"><h2 class="mt" data-i18n="newDebtor">Yangi qarzdor</h2><button class="mx" onclick="cm('addM')"><i class="fas fa-times"></i></button></div>
+<div class="fg"><label class="fl" data-i18n="name">Ism *</label><input class="fi" id="an" placeholder="Akramov Jasur"></div>
+<div class="fr">
+<div class="fg"><label class="fl" data-i18n="phone">Telefon</label><input class="fi" id="aph" placeholder="+998..."></div>
+<div class="fg"><label class="fl" data-i18n="amount">Summa *</label><input type="number" class="fi" id="aam" placeholder="1000000"></div>
+</div>
+<div class="fg"><label class="fl" data-i18n="currency">Valyuta</label>
+<div class="cur-sel"><button class="cur-btn ac" onclick="selCur('UZS',this)">🇺🇿 UZS</button><button class="cur-btn" onclick="selCur('USD',this)">🇸 USD</button><button class="cur-btn" onclick="selCur('EUR',this)">🇪🇺 EUR</button></div>
+<input type="hidden" id="acur" value="UZS"></div>
+<div class="fr">
+<div class="fg"><label class="fl" data-i18n="dueDate">Muddat</label><input type="date" class="fi" id="adt"></div>
+<div class="fg"><label class="fl" data-i18n="category">Kategoriya</label><select class="fi" id="aca"><option>Shaxsiy</option><option>Biznes</option><option>Oila</option><option>Do'st</option></select></div>
+</div>
+<div class="fg"><label class="fl">⭐ <span data-i18n="rating">Ishonch reytingi</span></label>
+<div class="rat" id="arat">⭐⭐⭐</div>
+<input type="hidden" id="aratv" value="3"></div>
+<div class="fg"><label class="fl" data-i18n="note">Izoh</label><textarea class="fi" id="ano" rows="2"></textarea></div>
+<button class="bs" onclick="addD()"><i class="fas fa-check"></i> <span data-i18n="save">Saqlash</span></button>
+</div></div>
+
+<div id="payM" class="mo"><div class="mc">
+<div class="mh"><h2 class="mt" data-i18n="addPayment">To'lov</h2><button class="mx" onclick="cm('payM')"><i class="fas fa-times"></i></button></div>
+<input type="hidden" id="pid">
+<div class="fg"><label class="fl" data-i18n="amount">Summa</label><input type="number" class="fi" id="pam"></div>
+<div class="fg"><label class="fl" data-i18n="note">Izoh</label><input class="fi" id="pno"></div>
+<button class="bs" onclick="payD()"><i class="fas fa-check"></i> <span data-i18n="confirm">Tasdiqlash</span></button>
+</div></div>
+
+<div id="histM" class="mo"><div class="mc">
+<div class="mh"><h2 class="mt" data-i18n="payHistory">To'lovlar tarixi</h2><button class="mx" onclick="cm('histM')"><i class="fas fa-times"></i></button></div>
+<div id="histList"></div>
+</div></div>
+
+<div id="imgM" class="mo"><div class="mc">
+<div class="mh"><h2 class="mt">📸 Rasm</h2><button class="mx" onclick="cm('imgM')"><i class="fas fa-times"></i></button></div>
+<div id="imgPrev" style="text-align:center;margin-bottom:16px"></div>
+<input type="file" id="imgFile" accept="image/*" style="margin-bottom:14px">
+<input type="hidden" id="imgId">
+<button class="bs" onclick="uploadImg()"><i class="fas fa-upload"></i> Yuklash</button>
+</div></div>
+
+<div id="remM" class="mo"><div class="mc">
+<div class="mh"><h2 class="mt">🔔 Eslatma</h2><button class="mx" onclick="cm('remM')"><i class="fas fa-times"></i></button></div>
+<textarea class="fi" id="remTxt" rows="6"></textarea>
+<p style="font-size:12px;color:var(--mut);margin:12px 0">Bu matnni nusxalab, qarzdorga Telegram/WhatsApp orqali yuboring</p>
+<button class="bs" onclick="copyRem()"><i class="fas fa-copy"></i> Nusxalash</button>
+</div></div>
+
+<script>
+const tg=window.Telegram?.WebApp;if(tg){tg.ready();tg.expand()}
+const H={'Content-Type':'application/json'};if(tg?.initData)H['X-Telegram-Init-Data']=tg.initData;
+let LANG=localStorage.getItem('lang')||'uz',RL='uz',pie=null,bar=null,pinBuf='',pinMode='check',selRating=3;
+
+const T={
+uz:{appTitle:"Qarz Daftar",appSubtitle:"Pro Edition",totalGiven:"Jami berilgan",remaining:"Qolgan",paid:"Tolangan",debtors:"Qarzdorlar",addDebtor:"Yangi qarzdor",debtorList:"Qarzdorlar",topDebtors:"TOP Qarzdorlar",statistics:"Statistika",reports:"Hisobotlar",downloadPdf:"PDF yuklab olish",settings:"Sozlamalar",navHome:"Bosh",navTop:"TOP",navStats:"Stat",navReport:"PDF",navSettings:"Soz",newDebtor:"Yangi qarzdor",name:"Ism *",phone:"Telefon",amount:"Summa *",currency:"Valyuta",dueDate:"Muddat",category:"Kategoriya",rating:"Ishonch reytingi",note:"Izoh",save:"Saqlash",addPayment:"To'lov",confirm:"Tasdiqlash",payHistory:"To'lovlar tarixi",pay:"To'lov",delete:"O'chirish",noDebtors:"Hali qarzdor yo'q",tapAbove:"Yuqoridagi tugmani bosing",debtorAdded:"Qo'shildi! ✨",paymentReceived:"Qabul qilindi! 💰",deleted:"O'chirildi!",confirmDelete:"O'chirilsinmi?",nameAmountRequired:"Ism va summa majburiy!",invalidAmount:"Noto'g'ri summa",total:"Jami",paidAmount:"Tolangan",statusActive:"Faol",statusOverdue:"Muddati o'tgan",statusPaid:"To'langan",pinDesc:"Ilovani himoyalash uchun 4 xonali PIN",setPin:"PIN o'rnatish",removePin:"PIN o'chirish",pinEnter:"PIN kiriting",pinSet:"Yangi PIN",pinConfirm:"PIN tasdiqlang",pinWrong:"Noto'g'ri PIN!",pinSaved:"PIN saqlandi",pinRemoved:"PIN o'chirildi",copied:"Nusxalandi!"},
+ru:{appTitle:"Долговая Книга",appSubtitle:"Про",totalGiven:"Выдано",remaining:"Остаток",paid:"Оплачено",debtors:"Должники",addDebtor:"Новый должник",debtorList:"Должники",topDebtors:"ТОП Должники",statistics:"Статистика",reports:"Отчёты",downloadPdf:"Скачать PDF",settings:"Настройки",navHome:"Главная",navTop:"ТОП",navStats:"Стат",navReport:"PDF",navSettings:"Настр",newDebtor:"Новый должник",name:"Имя *",phone:"Телефон",amount:"Сумма *",currency:"Валюта",dueDate:"Срок",category:"Категория",rating:"Рейтинг доверия",note:"Примечание",save:"Сохранить",addPayment:"Платёж",confirm:"Подтвердить",payHistory:"История платежей",pay:"Оплата",delete:"Удалить",noDebtors:"Нет должников",tapAbove:"Нажмите кнопку выше",debtorAdded:"Добавлен! ✨",paymentReceived:"Принят! 💰",deleted:"Удалено!",confirmDelete:"Удалить?",nameAmountRequired:"Имя и сумма обязательны!",invalidAmount:"Неверная сумма",total:"Всего",paidAmount:"Оплачено",statusActive:"Активен",statusOverdue:"Просрочен",statusPaid:"Оплачен",pinDesc:"4-значный PIN для защиты",setPin:"Установить PIN",removePin:"Удалить PIN",pinEnter:"Введите PIN",pinSet:"Новый PIN",pinConfirm:"Подтвердите PIN",pinWrong:"Неверный PIN!",pinSaved:"PIN сохранён",pinRemoved:"PIN удалён",copied:"Скопировано!"},
+en:{appTitle:"Debt Book",appSubtitle:"Pro",totalGiven:"Total Given",remaining:"Remaining",paid:"Paid",debtors:"Debtors",addDebtor:"New Debtor",debtorList:"Debtors",topDebtors:"TOP Debtors",statistics:"Statistics",reports:"Reports",downloadPdf:"Download PDF",settings:"Settings",navHome:"Home",navTop:"TOP",navStats:"Stats",navReport:"PDF",navSettings:"Set",newDebtor:"New Debtor",name:"Name *",phone:"Phone",amount:"Amount *",currency:"Currency",dueDate:"Due Date",category:"Category",rating:"Trust Rating",note:"Note",save:"Save",addPayment:"Payment",confirm:"Confirm",payHistory:"Payment History",pay:"Pay",delete:"Delete",noDebtors:"No debtors yet",tapAbove:"Tap the button above",debtorAdded:"Added! ✨",paymentReceived:"Received! 💰🎉",deleted:"Deleted!",confirmDelete:"Delete?",nameAmountRequired:"Name and amount required!",invalidAmount:"Invalid amount",total:"Total",paidAmount:"Paid",statusActive:"Active",statusOverdue:"Overdue",statusPaid:"Paid",pinDesc:"4-digit PIN to protect the app",setPin:"Set PIN",removePin:"Remove PIN",pinEnter:"Enter PIN",pinSet:"New PIN",pinConfirm:"Confirm PIN",pinWrong:"Wrong PIN!",pinSaved:"PIN saved",pinRemoved:"PIN removed",copied:"Copied!"}
+};
+function t(k){return T[LANG][k]||k}
+function ut(){document.querySelectorAll('[data-i18n]').forEach(e=>e.textContent=t(e.getAttribute('data-i18n')))}
+function toggleLang(){snd2();const L=['uz','ru','en'];LANG=L[(L.indexOf(LANG)+1)%3];localStorage.setItem('lang',LANG);ut();load();toast(' '+LANG.toUpperCase())}
+function setRL(l,b){snd2();RL=l;document.querySelectorAll('.lb').forEach(x=>x.classList.remove('ac'));b.classList.add('ac')}
+function sw(p,b){snd2();document.querySelectorAll('.page').forEach(x=>x.classList.remove('ac'));document.getElementById('page-'+p).classList.add('ac');document.querySelectorAll('.ni').forEach(n=>n.classList.remove('ac'));b.classList.add('ac');if(p==='stats')charts();if(p==='top')loadTop();if(p==='settings')loadSettings()}
+function selCur(c,b){document.querySelectorAll('.cur-btn').forEach(x=>x.classList.remove('ac'));b.classList.add('ac');document.getElementById('acur').value=c}
+
+function snd1(){try{const c=new AudioContext(),o=c.createOscillator(),g=c.createGain();o.connect(g);g.connect(c.destination);o.frequency.setValueAtTime(523.25,c.currentTime);o.frequency.setValueAtTime(659.25,c.currentTime+.1);o.frequency.setValueAtTime(783.99,c.currentTime+.2);g.gain.setValueAtTime(.3,c.currentTime);g.gain.exponentialRampToValueAtTime(.01,c.currentTime+.5);o.start();o.stop(c.currentTime+.5)}catch(e){}}
+function snd2(){try{const c=new AudioContext(),o=c.createOscillator(),g=c.createGain();o.connect(g);g.connect(c.destination);o.frequency.setValueAtTime(800,c.currentTime);g.gain.setValueAtTime(.2,c.currentTime);g.gain.exponentialRampToValueAtTime(.01,c.currentTime+.1);o.start();o.stop(c.currentTime+.1)}catch(e){}}
+function confetti(){const cv=document.getElementById('cc'),x=cv.getContext('2d');cv.width=innerWidth;cv.height=innerHeight;const ps=[],cl=['#667eea','#f093fb','#10b981','#f59e0b','#ef4444'];for(let i=0;i<100;i++)ps.push({x:cv.width/2,y:cv.height/2,vx:(Math.random()-.5)*20,vy:(Math.random()-.5)*20-10,c:cl[Math.floor(Math.random()*cl.length)],s:Math.random()*8+4,l:1});(function a(){x.clearRect(0,0,cv.width,cv.height);ps.forEach((p,i)=>{p.x+=p.vx;p.y+=p.vy;p.vy+=.5;p.l-=.02;x.fillStyle=p.c;x.globalAlpha=p.l;x.fillRect(p.x,p.y,p.s,p.s);if(p.l<=0)ps.splice(i,1)});if(ps.length)requestAnimationFrame(a)})()}
+function fm(a,c){c=c||'UZS';const s=new Intl.NumberFormat('uz-UZ').format(a||0);return c==='UZS'?s+" so'm":s+' '+c}
+function toast(m,e){const t2=document.getElementById('toast');t2.textContent=m;t2.className='toast sh'+(e?' er':'');setTimeout(()=>t2.classList.remove('sh'),3000)}
+function toggleTheme(){snd2();const b=document.body,d=b.getAttribute('data-theme')==='dark';b.setAttribute('data-theme',d?'light':'dark');localStorage.setItem('theme',d?'light':'dark');document.getElementById('ti').className=d?'fas fa-moon':'fas fa-sun'}
+
+// ===== PIN =====
+async function checkPin(){
+try{const s=await(await fetch('/api/settings',{headers:H})).json();
+if(s.pin_set){document.getElementById('pinScreen').style.display='flex';document.getElementById('mainApp').style.display='none';pinMode='check';pinBuf='';document.getElementById('pinSub').textContent=t('pinEnter');updDots()}
+else{document.getElementById('pinScreen').style.display='none';document.getElementById('mainApp').style.display='block';load()}}catch(e){document.getElementById('mainApp').style.display='block';load()}}
+function updDots(){document.querySelectorAll('.pin-dot').forEach((d,i)=>d.classList.toggle('filled',i<pinBuf.length))}
+function pinKey(k){if(pinBuf.length>=4)return;pinBuf+=k;updDots();snd2();if(pinBuf.length===4)setTimeout(handlePin,200)}
+function pinDel(){pinBuf=pinBuf.slice(0,-1);updDots()}
+function pinClear(){pinBuf='';updDots()}
+let pinFirst='';
+async function handlePin(){
+if(pinMode==='check'){
+try{const s=await(await fetch('/api/settings',{headers:H})).json();
+const stored=s.pin_code||'';
+if(pinBuf===stored){document.getElementById('pinScreen').style.display='none';document.getElementById('mainApp').style.display='block';load()}
+else{toast(t('pinWrong'),true);pinBuf='';updDots();document.querySelectorAll('.pin-dot').forEach(d=>{d.style.background='#ef4444';setTimeout(()=>d.style.background='',400)})}}catch(e){document.getElementById('pinScreen').style.display='none';document.getElementById('mainApp').style.display='block';load()}}
+else if(pinMode==='set'){pinFirst=pinBuf;pinBuf='';document.getElementById('pinSub').textContent=t('pinConfirm');updDots();pinMode='confirm'}
+else if(pinMode==='confirm'){
+if(pinBuf===pinFirst){await fetch('/api/settings/pin',{method:'POST',headers:H,body:JSON.stringify({pin:pinFirst})});toast(t('pinSaved'));document.getElementById('pinScreen').style.display='none';document.getElementById('mainApp').style.display='block';loadSettings();load()}
+else{toast(t('pinWrong'),true);pinMode='set';pinBuf='';document.getElementById('pinSub').textContent=t('pinSet');updDots()}}}
+function changePin(){snd2();document.getElementById('pinScreen').style.display='flex';document.getElementById('mainApp').style.display='none';pinMode='set';pinBuf='';pinFirst='';document.getElementById('pinSub').textContent=t('pinSet');updDots()}
+async function removePin(){snd2();await fetch('/api/settings/pin',{method:'POST',headers:H,body:JSON.stringify({pin:null})});toast(t('pinRemoved'));loadSettings()}
+
+async function loadSettings(){
+try{const s=await(await fetch('/api/settings',{headers:H})).json();
+document.getElementById('pinStatus').innerHTML=s.pin_set?'✅ PIN o\\'rnatilgan':'❌ PIN yo\\'q';
+const st=await(await fetch('/api/stats',{headers:H})).json();
+const r=st.rates||{};
+document.getElementById('ratesBox').innerHTML='💵 1 USD = '+(r.UZS?Math.round(r.UZS).toLocaleString():'—')+' UZS<br>💶 1 EUR = '+(r.UZS&&r.EUR?Math.round(r.UZS/r.EUR).toLocaleString():'—')+' UZS'}catch(e){}}
+
+async function load(){
+try{const s=await(await fetch('/api/stats',{headers:H})).json();
+document.getElementById('tg').textContent=fm(s.total_given);document.getElementById('tr').textContent=fm(s.total_remaining);
+document.getElementById('tp').textContent=fm(s.total_paid);document.getElementById('tc').textContent=s.total_debtors;
+const ds=await(await fetch('/api/debtors',{headers:H})).json();
+const l=document.getElementById('dl');
+if(!ds.length){l.innerHTML='<div class="es"><div class="ei"><i class="fas fa-inbox"></i></div><p style="font-size:16px;font-weight:600">'+t('noDebtors')+'</p><p style="font-size:12px;margin-top:6px;opacity:.7">'+t('tapAbove')+'</p></div>';return}
+l.innerHTML=ds.map((d,i)=>{const sc=d.status==='OVERDUE'?'overdue':d.status==='PAID'?'paid':'';const bc=d.status==='OVERDUE'?'bo':d.status==='PAID'?'bp':'ba';const st=d.status==='OVERDUE'?t('statusOverdue'):d.status==='PAID'?t('statusPaid'):t('statusActive');const stars='⭐'.repeat(d.rating||3);const c=d.currency||'UZS';
+return '<div class="dc '+sc+'" style="animation-delay:'+i*.04+'s"><div class="dh"><div><div class="dn">'+d.name+'</div><div class="rat" onclick="setR('+d.id+',event)">'+stars+'</div></div><div class="da">'+fm(d.remaining_amount,c)+'</div></div><div class="di">'+(d.phone?'<a href="tel:'+d.phone.replace(/[^+0-9]/g,'')+'"><i class="fas fa-phone"></i> '+d.phone+'</a>':'<span><i class="fas fa-phone"></i> -</span>')+'<span><i class="fas fa-tag"></i>'+d.category+'</span><span><i class="fas fa-coins"></i>'+c+'</span>'+(d.due_date?'<span><i class="fas fa-calendar"></i>'+d.due_date+'</span>':'')+'</div><span class="badge '+bc+'">'+st+'</span>'+(d.image_path?'<div style="margin-bottom:10px"><img src="'+d.image_path+'" style="max-width:100%;max-height:120px;border-radius:10px"></div>':'')+'<div class="dd"><b>'+t('total')+':</b> '+fm(d.total_amount,c)+' | <b>'+t('paidAmount')+':</b> '+fm(d.paid_amount,c)+'</div><div class="dac">'+(d.status!=='PAID'?'<button class="ba2 bpay" onclick="op('+d.id+','+d.remaining_amount+')"><i class="fas fa-money-bill-wave"></i>'+t('pay')+'</button>':'')+(d.phone?'<button class="ba2 bwa" onclick="wa(\\''+d.phone.replace(/[^+0-9]/g,'')+'\\')"><i class="fab fa-whatsapp"></i></button>':'')+'<button class="ba2 brem" onclick="rem('+d.id+')"><i class="fas fa-bell"></i></button><button class="ba2 bhist" onclick="hist('+d.id+')"><i class="fas fa-history"></i></button><button class="ba2" style="background:rgba(245,158,11,.15);color:#f59e0b" onclick="opImg('+d.id+',\\''+(d.image_path||'')+'\\')"><i class="fas fa-camera"></i></button><button class="ba2 bdel" onclick="delD('+d.id+')"><i class="fas fa-trash"></i></button></div></div>'}).join('')}catch(e){console.error(e);toast('Xato',true)}}
+
+async function loadTop(){try{const ds=await(await fetch('/api/debtors/top',{headers:H})).json();const l=document.getElementById('topList');if(!ds.length){l.innerHTML='<div class="es"><div class="ei"><i class="fas fa-trophy"></i></div><p>'+t('noDebtors')+'</p></div>';return}
+l.innerHTML=ds.map((d,i)=>{const c=d.currency||'UZS';const medal=i===0?'🥇':i===1?'🥈':i===2?'🥉':'<b style="color:var(--pri)">#'+(i+1)+'</b>';return '<div class="dc"><div class="dh"><div><div class="dn">'+medal+' '+d.name+'</div><div class="di"><span><i class="fas fa-star"></i>'+'⭐'.repeat(d.rating||3)+'</span></div></div><div class="da">'+fm(d.remaining_amount,c)+'</div></div></div>'}).join('')}catch(e){}}
+
+async function charts(){try{const s=await(await fetch('/api/stats',{headers:H})).json();const ds=await(await fetch('/api/debtors',{headers:H})).json();
+if(pie)pie.destroy();pie=new Chart(document.getElementById('pie'),{type:'doughnut',data:{labels:[t('paid'),t('remaining')],datasets:[{data:[s.total_paid,s.total_remaining],backgroundColor:['#10b981','#ef4444'],borderWidth:0}]},options:{plugins:{legend:{position:'bottom'}}}});
+if(bar)bar.destroy();const top=ds.slice(0,5);bar=new Chart(document.getElementById('bar'),{type:'bar',data:{labels:top.map(d=>d.name),datasets:[{label:t('remaining'),data:top.map(d=>d.remaining_amount),backgroundColor:'rgba(102,126,234,.8)',borderRadius:8}]},options:{plugins:{legend:{display:false}},scales:{y:{beginAtZero:true}}}})}catch(e){}}
+
+function downloadPDF(){snd1();window.open('/api/export/pdf?lang='+RL+'&initData='+encodeURIComponent(tg?.initData||''),'_blank')}
+function downloadCSV(){snd2();window.open('/api/export/csv?initData='+encodeURIComponent(tg?.initData||''),'_blank')}
+
+function openAdd(){snd2();document.getElementById('addM').classList.add('ac')}
+function cm(id){snd2();document.getElementById(id).classList.remove('ac')}
+function setR(v,e){e.stopPropagation();selRating=v;document.getElementById('arat').textContent='⭐'.repeat(v);document.getElementById('aratv').value=v}
+document.addEventListener('DOMContentLoaded',()=>{const ar=document.getElementById('arat');if(ar){let html='';for(let i=1;i<=5;i++)html+='<span style="cursor:pointer" onclick="setR('+i+',event)">'+'⭐'.repeat(i)+'</span> ';}});
+
+async function addD(){const d={name:document.getElementById('an').value.trim(),phone:document.getElementById('aph').value.trim(),amount:parseFloat(document.getElementById('aam').value),currency:document.getElementById('acur').value,due_date:document.getElementById('adt').value||null,category:document.getElementById('aca').value,note:document.getElementById('ano').value.trim(),rating:parseInt(document.getElementById('aratv').value)||3};
+if(!d.name||!d.amount){toast(t('nameAmountRequired'),true);return}
+try{const r=await fetch('/api/debtors',{method:'POST',headers:H,body:JSON.stringify(d)});if(!r.ok)throw 0;snd1();toast(t('debtorAdded'));cm('addM');['an','aph','aam','adt','ano'].forEach(i=>document.getElementById(i).value='');document.getElementById('arat').textContent='⭐⭐⭐';document.getElementById('aratv').value=3;load()}catch(e){toast('Xato',true)}}
+
+function op(id,rem){snd2();document.getElementById('pid').value=id;document.getElementById('pam').value=rem;document.getElementById('pno').value='';document.getElementById('payM').classList.add('ac')}
+async function payD(){const id=document.getElementById('pid').value,am=parseFloat(document.getElementById('pam').value),no=document.getElementById('pno').value.trim();if(!am||am<=0){toast(t('invalidAmount'),true);return}
+try{const r=await fetch('/api/debtors/'+id+'/pay',{method:'PUT',headers:H,body:JSON.stringify({amount:am,note:no})});if(!r.ok)throw 0;snd1();confetti();toast(t('paymentReceived'));cm('payM');load()}catch(e){toast('Xato',true)}}
+
+async function setR2(id,r){try{await fetch('/api/debtors/'+id+'/rating?rating='+r,{method:'PUT',headers:H});load()}catch(e){}}
+function wa(ph){snd2();window.open('https://wa.me/'+ph.replace(/^\\+/,''),'_blank')}
+async function rem(id){snd2();try{const r=await(await fetch('/api/remind/'+id,{headers:H})).json();document.getElementById('remTxt').value=r.text;document.getElementById('remM').classList.add('ac')}catch(e){toast('Xato',true)}}
+function copyRem(){const tx=document.getElementById('remTxt');tx.select();navigator.clipboard.writeText(tx.value);toast(t('copied'))}
+async function hist(id){snd2();try{const ps=await(await fetch('/api/payments/'+id,{headers:H})).json();const l=document.getElementById('histList');if(!ps.length){l.innerHTML='<p style="text-align:center;color:var(--mut);padding:30px">—</p>'}else{l.innerHTML=ps.map(p=>'<div class="pay-item"><div><div style="font-weight:700">'+fm(p.amount)+'</div><div style="font-size:11px;color:var(--mut)">'+(p.note||'—')+'</div></div><div style="font-size:11px;color:var(--mut)">'+new Date(p.payment_date).toLocaleDateString()+'</div></div>').join('')}document.getElementById('histM').classList.add('ac')}catch(e){}}
+function opImg(id,path){snd2();document.getElementById('imgId').value=id;document.getElementById('imgPrev').innerHTML=path?'<img src="'+path+'" style="max-width:100%;max-height:200px;border-radius:12px">':'<p style="color:var(--mut)">Rasm yo\\'q</p>';document.getElementById('imgFile').value='';document.getElementById('imgM').classList.add('ac')}
+async function uploadImg(){const id=document.getElementById('imgId').value,f=document.getElementById('imgFile').files[0];if(!f){toast('Rasm tanlang',true);return}const fd=new FormData();fd.append('file',f);try{const r=await fetch('/api/debtors/'+id+'/image',{method:'POST',headers:{'X-Telegram-Init-Data':tg?.initData||''},body:fd});if(!r.ok)throw 0;snd1();toast('Yuklandi!');cm('imgM');load()}catch(e){toast('Xato',true)}}
+async function delD(id){if(!confirm(t('confirmDelete')))return;try{const r=await fetch('/api/debtors/'+id,{method:'DELETE',headers:H});if(!r.ok)throw 0;snd2();toast(t('deleted'));load()}catch(e){toast('Xato',true)}}
+
+window.onload=()=>{const th=localStorage.getItem('theme')||'light';document.body.setAttribute('data-theme',th);document.getElementById('ti').className=th==='dark'?'fas fa-sun':'fas fa-moon';ut();
+const ar=document.getElementById('arat');if(ar){let h='';for(let i=1;i<=5;i++)h+='<span onclick="setR('+i+',event)" style="cursor:pointer">'+(i<=3?'⭐':'☆')+'</span>';ar.innerHTML='';for(let i=1;i<=5;i++){const sp=document.createElement('span');sp.style.cursor='pointer';sp.textContent=i<=3?'⭐':'☆';sp.onclick=(e)=>setR(i,e);ar.appendChild(sp)}}
+checkPin()};
+</script>
+</body></html>"""
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return HTMLResponse(HTML_TEMPLATE)
 
 
 # ============ BOT ============
 @dp.message(CommandStart())
 async def cmd_start(m: types.Message):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📒 Ilovani ochish", web_app=WebAppInfo(url=WEBAPP_URL))]])
-    await m.answer(
-        "<b>💎 Qarz Daftar Pro</b>\n\n"
-        "✨ Premium dizayn\n"
-        "🎵 Tovush + 🎊 Confetti\n"
-        "📊 Grafiklar va statistika\n"
-        "📄 Hisobotlar (UZ/RU/EN)\n"
-        "🌍 3 til qo'llab-quvvatlanadi\n\n"
-        "Tugmani bosing 👇",
-        reply_markup=kb)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📒 Ilovani ochish", web_app=WebAppInfo(url=WEBAPP_URL))]])
+    await m.answer("<b>💎 Qarz Daftar Pro</b>\n\n🔐 PIN himoya\n📸 Rasm biriktirish\n🖨️ PDF hisobot (3 til)\n🏆 TOP qarzdorlar\n⭐ Ishonch reytingi\n🔔 Eslatma matni\n💱 Multi-valyuta\n💳 To'lovlar tarixi\n\nTugmani bosing 👇", reply_markup=kb)
 
 
 @dp.message(Command("report"))
@@ -548,26 +787,33 @@ async def cmd_report(m: types.Message):
     uid = m.from_user.id
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cur = await db.execute("""
-            SELECT COUNT(*) as n, COALESCE(SUM(total_amount),0) g,
-                   COALESCE(SUM(paid_amount),0) p, COALESCE(SUM(remaining_amount),0) r
-            FROM debtors WHERE user_id=?""", (uid,))
+        cur = await db.execute("SELECT COUNT(*) n,COALESCE(SUM(total_amount),0) g,COALESCE(SUM(paid_amount),0) p,COALESCE(SUM(remaining_amount),0) r FROM debtors WHERE user_id=?", (uid,))
         s = dict(await cur.fetchone())
-        cur = await db.execute("SELECT name,phone,remaining_amount,status FROM debtors WHERE user_id=? ORDER BY created_at DESC", (uid,))
-        ds = await cur.fetchall()
-    txt = (f"📊 <b>QARZ DAFTAR HISOBOTI</b>\n📅 {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
-           f"👥 Qarzdorlar: <b>{s['n']}</b>\n💰 Berilgan: <b>{s['g']:,.0f} so'm</b>\n"
-           f"✅ Tolangan: <b>{s['p']:,.0f} so'm</b>\n⏳ Qolgan: <b>{s['r']:,.0f} so'm</b>\n\n<b>📋 Ro'yxat:</b>\n")
-    if not ds:
-        txt += "\n<i>Hali qarzdor yo'q</i>"
-    else:
-        for d in ds:
-            e = "✅" if d["status"] == "PAID" else "⏳" if d["status"] == "ACTIVE" else "⚠️"
-            txt += f"\n{e} <b>{d['name']}</b> — {d['remaining_amount']:,.0f} so'm"
-    await m.answer(txt)
+    await m.answer(f"📊 <b>HISOBOT</b>\n👥 {s['n']}\n💰 {s['g']:,.0f}\n✅ {s['p']:,.0f}\n⏳ {s['r']:,.0f}")
+    buf = BytesIO()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT name,phone,total_amount,paid_amount,remaining_amount,currency,status FROM debtors WHERE user_id=?", (uid,))
+        rows = [dict(r) for r in await cur.fetchall()]
+    doc = SimpleDocTemplate(buf, pagesize=A4)
+    els = [Paragraph("QARZ DAFTAR", getSampleStyleSheet()['Heading1']), Spacer(1, 12)]
+    data = [["Ism", "Jami", "Qolgan", "Holat"]] + [[r["name"], f"{r['total_amount']:.0f}", f"{r['remaining_amount']:.0f}", r["status"]] for r in rows]
+    els.append(Table(data, colWidths=[180, 120, 120, 100]))
+    doc.build(els)
+    buf.seek(0)
+    await m.answer_document(FSInputFile(buf, filename="hisobot.pdf"))
 
 
-# ============ START ============
+@dp.message(Command("backup"))
+async def cmd_backup(m: types.Message):
+    uid = m.from_user.id
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT name,phone,total_amount,currency,paid_amount,remaining_amount,status,due_date FROM debtors WHERE user_id=?", (uid,))
+        rows = await cur.fetchall()
+    lines = ["Ism;Telefon;Jami;Valyuta;Tolangan;Qolgan;Holat;Muddat"] + [";".join("" if x is None else str(x) for x in r) for r in rows]
+    await m.answer_document(FSInputFile(BytesIO("\n".join(lines).encode()), filename="backup.csv"))
+
+
 def run_bot():
     try:
         logger.info("🤖 Bot ishga tushmoqda...")
