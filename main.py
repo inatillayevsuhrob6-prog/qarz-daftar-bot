@@ -47,6 +47,14 @@ class PaymentCreate(BaseModel):
     note: Optional[str] = None
 
 
+class DebtorUpdate(BaseModel):
+    name: str
+    phone: Optional[str] = None
+    category: str = "Shaxsiy"
+    note: Optional[str] = None
+    due_date: Optional[str] = None
+
+
 # ============ DATABASE ============
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -269,6 +277,12 @@ body::before{content:'';position:fixed;top:-50%;left:-50%;width:200%;height:200%
 <div class="stat-card"><div class="stat-icon purple"><i class="fas fa-users"></i></div><div class="stat-label" data-i18n="debtors">Qarzdorlar</div><div class="stat-value" id="total-count">0</div></div>
 </div>
 <button class="main-btn" onclick="openAddModal()"><i class="fas fa-plus-circle"></i><span data-i18n="addDebtor">Yangi qarzdor qo'shish</span></button>
+<button class="main-btn"
+        onclick="openMessageModal()"
+        style="background:linear-gradient(135deg,#10b981,#059669);box-shadow:0 12px 40px rgba(16,185,129,.35);">
+    <i class="fas fa-paper-plane"></i>
+    <span>📩 Xabar yuborish</span>
+</button>
 <div class="section-title"><i class="fas fa-list-ul"></i><span data-i18n="debtorList">Qarzdorlar ro'yxati</span></div>
 <div id="debtors-list"></div>
 </div>
@@ -295,6 +309,107 @@ body::before{content:'';position:fixed;top:-50%;left:-50%;width:200%;height:200%
 <button class="nav-item active" onclick="switchPage('home',this)"><i class="fas fa-home"></i><span data-i18n="navHome">Bosh</span></button>
 <button class="nav-item" onclick="switchPage('stats',this)"><i class="fas fa-chart-pie"></i><span data-i18n="navStats">Stat</span></button>
 <button class="nav-item" onclick="switchPage('report',this)"><i class="fas fa-file-alt"></i><span data-i18n="navReport">Hisobot</span></button>
+</div>
+
+
+<div id="editModal" class="modal-overlay">
+<div class="modal-content">
+<div class="modal-header">
+<h2 class="modal-title">✏️ Qarzdorni tahrirlash</h2>
+<button class="modal-close" onclick="closeModal('editModal')">
+<i class="fas fa-times"></i>
+</button>
+</div>
+
+<input type="hidden" id="edit-id">
+
+<div class="form-group">
+<label class="form-label">👤 Ism familiya *</label>
+<input type="text" class="form-input" id="edit-name">
+</div>
+
+<div class="form-group">
+<label class="form-label">📱 Telefon</label>
+<input type="tel" class="form-input" id="edit-phone">
+</div>
+
+<div class="form-row">
+<div class="form-group">
+<label class="form-label">📁 Kategoriya</label>
+<select class="form-input" id="edit-category">
+<option>Shaxsiy</option>
+<option>Biznes</option>
+<option>Oila</option>
+<option>Do'st</option>
+</select>
+</div>
+
+<div class="form-group">
+<label class="form-label">📅 Muddat</label>
+<input type="date" class="form-input" id="edit-due-date">
+</div>
+</div>
+
+<div class="form-group">
+<label class="form-label">📝 Izoh</label>
+<textarea class="form-input" id="edit-note" rows="2"></textarea>
+</div>
+
+<button class="btn-submit" onclick="saveDebtorEdit()">
+<i class="fas fa-save"></i> Saqlash
+</button>
+</div>
+</div>
+
+
+<div id="messageModal" class="modal-overlay">
+<div class="modal-content">
+<div class="modal-header">
+<h2 class="modal-title">📩 Xabar yuborish</h2>
+<button class="modal-close" onclick="closeModal('messageModal')">
+<i class="fas fa-times"></i>
+</button>
+</div>
+
+<div class="form-group">
+<label class="form-label">👤 Qarzdorni tanlang</label>
+<select class="form-input" id="message-debtor" onchange="selectMessageDebtor()">
+<option value="">-- Qarzdorni tanlang --</option>
+</select>
+</div>
+
+<div class="form-group">
+<label class="form-label">📱 Telefon</label>
+<input type="tel" class="form-input" id="message-phone" placeholder="+998901234567">
+</div>
+
+<div class="form-group">
+<label class="form-label">💬 Xabar</label>
+<textarea class="form-input" id="message-text" rows="5" placeholder="Xabarni o'zingiz yozing..."></textarea>
+</div>
+
+<div style="font-size:13px;font-weight:700;margin-bottom:10px;color:var(--text-light);">
+💡 Tayyor matnlar
+</div>
+
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:18px;">
+<button class="lang-btn" onclick="messageTemplate('debt')">💳 Qarz eslatmasi</button>
+<button class="lang-btn" onclick="messageTemplate('soft')">🤝 Muloyim eslatma</button>
+<button class="lang-btn" onclick="messageTemplate('due')">📅 Muddat</button>
+<button class="lang-btn" onclick="messageTemplate('thanks')">🙏 Rahmat</button>
+</div>
+
+<button class="btn-submit"
+        style="background:linear-gradient(135deg,#10b981,#059669);"
+        onclick="sendRealSms()">
+<i class="fas fa-paper-plane"></i> Xabar yuborish
+</button>
+
+<div style="font-size:11px;color:var(--text-light);text-align:center;margin-top:10px;">
+Telefonning SMS oynasi ochiladi. Yuborishni telefoningizdan tasdiqlaysiz.
+</div>
+
+</div>
 </div>
 
 <div id="addModal" class="modal-overlay"><div class="modal-content">
@@ -334,7 +449,7 @@ en:{appTitle:"Debt Book",appSubtitle:"Premium",totalGiven:"Total Given",remainin
 
 let currentLang=localStorage.getItem('lang')||'uz';
 let reportLang='uz';
-let pieChart=null,barChart=null;
+let pieChart=null,barChart=null,currentDebtors=[];
 
 function t(k){return translations[currentLang][k]||k}
 function updateTranslations(){document.querySelectorAll('[data-i18n]').forEach(el=>{el.textContent=t(el.getAttribute('data-i18n'))})}
@@ -359,13 +474,21 @@ document.getElementById('total-remaining').textContent=formatMoney(s.total_remai
 document.getElementById('total-paid').textContent=formatMoney(s.total_paid);
 document.getElementById('total-count').textContent=s.total_debtors;
 const ds=await (await fetch('/api/debtors',{headers})).json();
+currentDebtors=ds;
+updateMessageDebtors();
 const list=document.getElementById('debtors-list');
 if(!ds.length){list.innerHTML='<div class="empty-state"><div class="empty-icon"><i class="fas fa-inbox"></i></div><p style="font-size:17px;font-weight:600">'+t('noDebtors')+'</p><p style="font-size:13px;margin-top:6px;opacity:.7">'+t('tapAbove')+'</p></div>';return}
 list.innerHTML=ds.map((d,i)=>{
 const sc=d.status==='OVERDUE'?'overdue':d.status==='PAID'?'paid':'';
 const bc=d.status==='OVERDUE'?'badge-overdue':d.status==='PAID'?'badge-paid':'badge-active';
 const st=d.status==='OVERDUE'?t('statusOverdue'):d.status==='PAID'?t('statusPaid'):t('statusActive');
-return '<div class="debtor-card '+sc+'" style="animation-delay:'+(i*0.05)+'s"><div class="debtor-header"><div class="debtor-name">'+d.name+'</div><div class="debtor-amount">'+formatMoney(d.remaining_amount)+'</div></div><div class="debtor-info"><span><i class="fas fa-phone"></i>'+(d.phone||'-')+'</span><span><i class="fas fa-tag"></i>'+d.category+'</span>'+(d.due_date?'<span><i class="fas fa-calendar"></i>'+d.due_date+'</span>':'')+'</div><span class="debtor-badge '+bc+'">'+st+'</span><div class="debtor-details"><strong>'+t('total')+':</strong> '+formatMoney(d.total_amount)+' | <strong>'+t('paidAmount')+':</strong> '+formatMoney(d.paid_amount)+'</div><div class="debtor-actions">'+(d.status!=='PAID'?'<button class="btn-action btn-pay" onclick="openPayModal('+d.id+','+d.remaining_amount+')"><i class="fas fa-money-bill-wave"></i>'+t('pay')+'</button>':'')+'<button class="btn-action btn-delete" onclick="deleteDebtor('+d.id+')"><i class="fas fa-trash"></i>'+t('delete')+'</button></div></div>'}).join('');
+return '<div class="debtor-card '+sc+'" style="animation-delay:'+(i*0.05)+'s"><div class="debtor-header"><div class="debtor-name">'+d.name+'</div><div class="debtor-amount">'+formatMoney(d.remaining_amount)+'</div></div><div class="debtor-info"><span><i class="fas fa-phone"></i>'+(d.phone||'-')+'</span><span><i class="fas fa-tag"></i>'+d.category+'</span>'+(d.due_date?'<span><i class="fas fa-calendar"></i>'+d.due_date+'</span>':'')+'</div><span class="debtor-badge '+bc+'">'+st+'</span><div class="debtor-details"><strong>'+t('total')+':</strong> '+formatMoney(d.total_amount)+' | <strong>'+t('paidAmount')+':</strong> '+formatMoney(d.paid_amount)+'</div><div class="debtor-actions">'+(d.status!=='PAID'?'<button class="btn-action btn-pay" onclick="openPayModal('+d.id+','+d.remaining_amount+')"><i class="fas fa-money-bill-wave"></i>'+t('pay')+'</button>':'')+'<button class="btn-action"
+onclick="openEditModal('+d.id+')"
+style="background:rgba(102,126,234,.15);color:var(--primary);">
+<i class="fas fa-edit"></i> Tahrirlash
+</button>
+<button class="btn-action btn-delete" onclick="deleteDebtor('+d.id+')">
+<i class="fas fa-trash"></i>'+t('delete')+'</button></div></div>'}).join('');
 }catch(e){console.error(e);showToast('Xato: '+e.message,true)}
 }
 
@@ -392,6 +515,190 @@ if(!ds.length){h+='<p style="text-align:center;color:var(--text-light);padding:3
 else{h+=ds.map(d=>'<div style="padding:12px;background:rgba(0,0,0,.03);border-radius:10px;margin-bottom:8px"><div style="display:flex;justify-content:space-between;margin-bottom:4px"><strong>'+d.name+'</strong><strong style="color:var(--primary)">'+formatMoney(d.remaining_amount)+'</strong></div><div style="font-size:12px;color:var(--text-light)">'+(d.phone||'-')+' | '+d.category+' | '+d.status+'</div></div>').join('')}
 document.getElementById('report-preview').innerHTML=h;
 }catch(e){console.error(e)}
+}
+
+
+function openEditModal(id){
+    playClickSound();
+
+    const d=currentDebtors.find(x=>Number(x.id)===Number(id));
+
+    if(!d){
+        showToast('Qarzdor topilmadi',true);
+        return;
+    }
+
+    document.getElementById('edit-id').value=d.id;
+    document.getElementById('edit-name').value=d.name||'';
+    document.getElementById('edit-phone').value=d.phone||'';
+    document.getElementById('edit-category').value=d.category||'Shaxsiy';
+    document.getElementById('edit-due-date').value=d.due_date||'';
+    document.getElementById('edit-note').value=d.note||'';
+
+    document.getElementById('editModal').classList.add('active');
+}
+
+async function saveDebtorEdit(){
+    const id=document.getElementById('edit-id').value;
+
+    const data={
+        name:document.getElementById('edit-name').value.trim(),
+        phone:document.getElementById('edit-phone').value.trim()||null,
+        category:document.getElementById('edit-category').value,
+        due_date:document.getElementById('edit-due-date').value||null,
+        note:document.getElementById('edit-note').value.trim()||null
+    };
+
+    if(!data.name){
+        showToast('Ism familiya majburiy!',true);
+        return;
+    }
+
+    try{
+        const r=await fetch('/api/debtors/'+id,{
+            method:'PUT',
+            headers,
+            body:JSON.stringify(data)
+        });
+
+        const result=await r.json();
+
+        if(!r.ok){
+            throw new Error(result.detail||'Tahrirlashda xato');
+        }
+
+        playSuccessSound();
+        showToast('✅ Qarzdor yangilandi');
+        closeModal('editModal');
+        await loadData();
+
+    }catch(e){
+        showToast('Xato: '+e.message,true);
+    }
+}
+
+function updateMessageDebtors(){
+    const select=document.getElementById('message-debtor');
+
+    if(!select)return;
+
+    const current=select.value;
+
+    select.innerHTML='<option value="">-- Qarzdorni tanlang --</option>';
+
+    currentDebtors.forEach(d=>{
+        if(d.phone){
+            const o=document.createElement('option');
+            o.value=d.id;
+            o.textContent=d.name+' — '+d.phone+' — '+formatMoney(d.remaining_amount);
+            select.appendChild(o);
+        }
+    });
+
+    if(current){
+        select.value=current;
+    }
+}
+
+function openMessageModal(){
+    playClickSound();
+    updateMessageDebtors();
+
+    document.getElementById('messageModal').classList.add('active');
+
+    if(!document.getElementById('message-text').value){
+        document.getElementById('message-text').value=
+            'Assalomu alaykum! Qarz bo‘yicha eslatma. Iltimos, imkon bo‘lsa to‘lovni amalga oshiring. Rahmat.';
+    }
+}
+
+function selectMessageDebtor(){
+    const id=document.getElementById('message-debtor').value;
+
+    const d=currentDebtors.find(
+        x=>String(x.id)===String(id)
+    );
+
+    if(!d)return;
+
+    document.getElementById('message-phone').value=d.phone||'';
+
+    document.getElementById('message-text').value=
+        'Assalomu alaykum, '+d.name+'!\\n\\n'+
+        'Sizdagi qolgan qarz: '+formatMoney(d.remaining_amount)+'.\\n'+
+        'Iltimos, imkon bo‘lsa to‘lovni amalga oshiring.\\n\\n'+
+        'Rahmat!';
+}
+
+function messageTemplate(type){
+    const id=document.getElementById('message-debtor').value;
+
+    const d=currentDebtors.find(
+        x=>String(x.id)===String(id)
+    );
+
+    if(!d){
+        showToast('Avval qarzdorni tanlang',true);
+        return;
+    }
+
+    const amount=formatMoney(d.remaining_amount);
+    const name=d.name;
+
+    let text='';
+
+    if(type==='debt'){
+        text=
+            'Assalomu alaykum, '+name+'!\\n\\n'+
+            'Sizdagi qolgan qarz: '+amount+'.\\n'+
+            'Iltimos, imkon bo‘lsa to‘lovni amalga oshiring.\\n\\n'+
+            'Rahmat!';
+    }
+
+    if(type==='soft'){
+        text=
+            'Assalomu alaykum, '+name+'! 😊\\n\\n'+
+            'Qarz bo‘yicha kichik eslatma: '+amount+'.\\n'+
+            'Qulay vaqtingizda to‘lovni amalga oshirsangiz, xursand bo‘lamiz.\\n\\n'+
+            'Rahmat!';
+    }
+
+    if(type==='due'){
+        text=
+            'Assalomu alaykum, '+name+'!\\n\\n'+
+            'Qarz summasi: '+amount+'.\\n'+
+            (d.due_date?'Kelishilgan muddat: '+d.due_date+'.\\n\\n':'\\n')+
+            'Rahmat!';
+    }
+
+    if(type==='thanks'){
+        text=
+            'Assalomu alaykum, '+name+'!\\n\\n'+
+            'To‘lovingiz uchun katta rahmat! 🙏\\n'+
+            'Qolgan qarz: '+amount+'.';
+    }
+
+    document.getElementById('message-text').value=text;
+}
+
+function sendRealSms(){
+    let phone=document.getElementById('message-phone').value.trim();
+    const text=document.getElementById('message-text').value.trim();
+
+    if(!phone){
+        showToast('Telefon raqamini kiriting',true);
+        return;
+    }
+
+    if(!text){
+        showToast('Xabar matnini yozing',true);
+        return;
+    }
+
+    phone=phone.replace(/[^\d+]/g,'');
+
+    window.location.href=
+        'sms:'+phone+'?body='+encodeURIComponent(text);
 }
 
 function openAddModal(){playClickSound();document.getElementById('addModal').classList.add('active')}
@@ -479,6 +786,51 @@ async def create_debtor(d: DebtorCreate, user: dict = Depends(get_current_user))
         """, (user["telegram_id"], d.name, d.phone, d.category, d.note, d.amount, d.amount, d.due_date))
         await db.commit()
         return {"id": cur.lastrowid}
+
+
+@app.put("/api/debtors/{debtor_id}")
+async def update_debtor(
+    debtor_id: int,
+    d: DebtorUpdate,
+    user: dict = Depends(get_current_user)
+):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT id FROM debtors WHERE id=? AND user_id=?",
+            (debtor_id, user["telegram_id"])
+        )
+        row = await cur.fetchone()
+
+        if not row:
+            raise HTTPException(404, "Qarzdor topilmadi")
+
+        if not d.name.strip():
+            raise HTTPException(400, "Ism familiya majburiy")
+
+        await db.execute(
+            """
+            UPDATE debtors
+            SET name=?,
+                phone=?,
+                category=?,
+                note=?,
+                due_date=?
+            WHERE id=? AND user_id=?
+            """,
+            (
+                d.name.strip(),
+                d.phone,
+                d.category or "Shaxsiy",
+                d.note,
+                d.due_date,
+                debtor_id,
+                user["telegram_id"]
+            )
+        )
+
+        await db.commit()
+
+        return {"ok": True}
 
 
 @app.put("/api/debtors/{debtor_id}/pay")
