@@ -285,6 +285,81 @@ body::before{content:'';position:fixed;top:-50%;left:-50%;width:200%;height:200%
     <span>📩 Xabar yuborish</span>
 </button>
 <div class="section-title"><i class="fas fa-list-ul"></i><span data-i18n="debtorList">Qarzdorlar ro'yxati</span></div>
+<div style="display:flex;justify-content:flex-end;margin:-8px 0 16px;">
+<button class="main-btn" style="margin:0;width:auto;padding:13px 20px;" onclick="openSmsModal()">
+<i class="fas fa-comment-sms"></i>
+<span>📩 Xabar yuborish</span>
+</button>
+</div>
+
+<div id="smsModal" class="modal-overlay">
+<div class="modal-content">
+
+<div class="modal-header">
+<h2 class="modal-title">📩 Xabar yuborish</h2>
+<button class="modal-close" onclick="closeModal('smsModal')">
+<i class="fas fa-times"></i>
+</button>
+</div>
+
+<div class="form-group">
+<label class="form-label">👤 Qarzdorni tanlang</label>
+<select class="form-input" id="sms-debtor" onchange="selectSmsDebtor()">
+<option value="">-- Qarzdorni tanlang --</option>
+</select>
+</div>
+
+<div class="form-group">
+<label class="form-label">📱 Telefon raqami</label>
+<input type="tel" class="form-input" id="sms-phone" placeholder="+998901234567">
+</div>
+
+<div class="form-group">
+<label class="form-label">💬 Xabar</label>
+<textarea class="form-input" id="sms-text" rows="6"
+placeholder="Xabarni o'zingiz yozing..."></textarea>
+</div>
+
+<div style="font-size:13px;font-weight:800;margin-bottom:10px;">
+💡 Tayyor xabarlar
+</div>
+
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:18px;">
+
+<button class="btn-action" style="background:rgba(102,126,234,.12);color:var(--primary);"
+onclick="smsIdea('eslatma')">
+💳 Qarz eslatmasi
+</button>
+
+<button class="btn-action" style="background:rgba(16,185,129,.12);color:var(--success);"
+onclick="smsIdea('muloyim')">
+🤝 Muloyim
+</button>
+
+<button class="btn-action" style="background:rgba(245,158,11,.12);color:var(--warning);"
+onclick="smsIdea('muddat')">
+📅 Muddat
+</button>
+
+<button class="btn-action" style="background:rgba(139,92,246,.12);color:#8b5cf6;"
+onclick="smsIdea('rahmat')">
+🙏 Rahmat
+</button>
+
+</div>
+
+<button class="btn-submit" onclick="sendRealSms()">
+<i class="fas fa-paper-plane"></i>
+📤 Xabar yuborish
+</button>
+
+<div style="font-size:11px;text-align:center;color:var(--text-light);margin-top:10px;">
+Telefonning SMS ilovasi ochiladi. Yuborishni o'zingiz tasdiqlaysiz.
+</div>
+
+</div>
+</div>
+
 <div id="debtors-list"></div>
 </div>
 
@@ -781,6 +856,257 @@ function sendRealSms(){
         'sms:'+phone+
         '?body='+
         encodeURIComponent(text);
+}
+
+
+async function openSmsModal(){
+    playClickSound();
+
+    const select = document.getElementById('sms-debtor');
+
+    select.innerHTML =
+        '<option value="">⏳ Qarzdorlar yuklanmoqda...</option>';
+
+    try {
+        const r = await fetch('/api/debtors', {headers});
+
+        if(!r.ok)
+            throw new Error('Qarzdorlarni olishda xato');
+
+        const debtors = await r.json();
+
+        select.innerHTML =
+            '<option value="">-- Qarzdorni tanlang --</option>';
+
+        debtors.forEach(d => {
+
+            const option = document.createElement('option');
+
+            option.value = d.id;
+            option.dataset.phone = d.phone || '';
+            option.dataset.name = d.name || '';
+            option.dataset.remaining =
+                d.remaining_amount || 0;
+
+            option.textContent =
+                d.name + ' — ' +
+                (d.phone || 'Telefon yo‘q') +
+                ' — ' +
+                formatMoney(d.remaining_amount);
+
+            select.appendChild(option);
+        });
+
+        document.getElementById('sms-phone').value = '';
+        document.getElementById('sms-text').value = '';
+
+        document.getElementById('smsModal')
+            .classList.add('active');
+
+    } catch(e) {
+
+        console.error(e);
+
+        showToast(
+            'Qarzdorlarni yuklashda xato',
+            true
+        );
+    }
+}
+
+
+function selectSmsDebtor(){
+
+    const select =
+        document.getElementById('sms-debtor');
+
+    const option =
+        select.options[select.selectedIndex];
+
+    if(!option || !option.value){
+
+        document.getElementById('sms-phone').value = '';
+        document.getElementById('sms-text').value = '';
+
+        return;
+    }
+
+    const name =
+        option.dataset.name || '';
+
+    const phone =
+        option.dataset.phone || '';
+
+    const remaining =
+        Number(option.dataset.remaining || 0);
+
+    document.getElementById('sms-phone').value =
+        phone;
+
+    document.getElementById('sms-text').value =
+        'Assalomu alaykum, ' +
+        name +
+        '!\\n\\n' +
+
+        'Sizdagi qolgan qarz: ' +
+        formatMoney(remaining) +
+        '.\\n' +
+
+        'Iltimos, imkon bo‘lsa to‘lovni amalga oshiring.\\n\\n' +
+
+        'Rahmat!';
+}
+
+
+function smsIdea(type){
+
+    const select =
+        document.getElementById('sms-debtor');
+
+    const option =
+        select.options[select.selectedIndex];
+
+    if(!option || !option.value){
+
+        showToast(
+            'Avval qarzdorni tanlang!',
+            true
+        );
+
+        return;
+    }
+
+    const name =
+        option.dataset.name || '';
+
+    const remaining =
+        Number(option.dataset.remaining || 0);
+
+    const sum =
+        formatMoney(remaining);
+
+    let text = '';
+
+
+    if(type === 'eslatma'){
+
+        text =
+            'Assalomu alaykum, ' +
+            name +
+            '!\\n\\n' +
+
+            'Sizdagi qolgan qarz: ' +
+            sum +
+            '.\\n' +
+
+            'Iltimos, imkon bo‘lsa to‘lovni amalga oshiring.\\n\\n' +
+
+            'Rahmat!';
+    }
+
+
+    if(type === 'muloyim'){
+
+        text =
+            'Assalomu alaykum, ' +
+            name +
+            '! 😊\\n\\n' +
+
+            'Qarz bo‘yicha kichik eslatma: ' +
+            sum +
+            '.\\n' +
+
+            'Qulay vaqtingizda to‘lovni amalga oshirsangiz, xursand bo‘lamiz.\\n\\n' +
+
+            'Rahmat!';
+    }
+
+
+    if(type === 'muddat'){
+
+        text =
+            'Assalomu alaykum, ' +
+            name +
+            '!\\n\\n' +
+
+            'Qarz bo‘yicha eslatma: ' +
+            sum +
+            '.\\n' +
+
+            'Iltimos, kelishilgan muddatda to‘lovni amalga oshiring.\\n\\n' +
+
+            'Rahmat!';
+    }
+
+
+    if(type === 'rahmat'){
+
+        text =
+            'Assalomu alaykum, ' +
+            name +
+            '! 🙏\\n\\n' +
+
+            'To‘lovingiz uchun katta rahmat!\\n' +
+
+            'Qolgan qarz: ' +
+            sum +
+            '.';
+    }
+
+
+    document.getElementById('sms-text').value =
+        text;
+}
+
+
+function sendRealSms(){
+
+    let phone =
+        document.getElementById('sms-phone')
+        .value
+        .trim();
+
+    const text =
+        document.getElementById('sms-text')
+        .value
+        .trim();
+
+
+    if(!phone){
+
+        showToast(
+            'Telefon raqamini kiriting!',
+            true
+        );
+
+        return;
+    }
+
+
+    if(!text){
+
+        showToast(
+            'Xabar matnini yozing!',
+            true
+        );
+
+        return;
+    }
+
+
+    phone =
+        phone.replace(/[^\d+]/g, '');
+
+
+    const smsUrl =
+        'sms:' +
+        phone +
+        '?body=' +
+        encodeURIComponent(text);
+
+
+    window.location.href =
+        smsUrl;
 }
 
 function openAddModal(){playClickSound();document.getElementById('addModal').classList.add('active')}
