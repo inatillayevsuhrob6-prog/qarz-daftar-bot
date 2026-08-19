@@ -47,6 +47,16 @@ class PaymentCreate(BaseModel):
     note: Optional[str] = None
 
 
+class SendMessage(BaseModel):
+    debtor_id: int
+    message: str
+
+
+class SendMessage(BaseModel):
+    debtor_id: int
+    message: str
+
+
 # ============ DATABASE ============
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -75,6 +85,10 @@ async def init_db():
                 payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        try:
+            await db.execute("ALTER TABLE debtors ADD COLUMN telegram_target INTEGER")
+        except:
+            pass
         await db.commit()
     logger.info("✅ Database yaratildi")
 
@@ -311,8 +325,8 @@ body::before{content:'';position:fixed;top:-50%;left:-50%;width:200%;height:200%
 <button class="btn-submit" style="background:#6b7280;padding:12px;font-size:13px" onclick="tpl('muddat')">📅 Muddat</button>
 <button class="btn-submit" style="background:#6b7280;padding:12px;font-size:13px" onclick="tpl('rahmat')">🙏 Rahmat</button>
 </div>
-<button class="btn-submit" style="background:linear-gradient(135deg,#10b981,#059669)" onclick="sendSMS()">📤 Yuborish (WhatsApp)</button>
-<div style="font-size:11px;color:var(--text-light);text-align:center;margin-top:10px">Xabar nusxalanadi va WhatsApp ochiladi</div>
+<button class="btn-submit" style="background:linear-gradient(135deg,#10b981,#059669)" onclick="sendSMS()">📤 Telegram orqali yuborish</button>
+<div style="font-size:11px;color:var(--text-light);text-align:center;margin-top:10px">Qarzdor botga /link ID yozgan bo'lishi kerak</div>
 </div>
 
 <div id="addModal" class="modal-overlay"><div class="modal-content">
@@ -383,7 +397,7 @@ list.innerHTML=ds.map((d,i)=>{
 const sc=d.status==='OVERDUE'?'overdue':d.status==='PAID'?'paid':'';
 const bc=d.status==='OVERDUE'?'badge-overdue':d.status==='PAID'?'badge-paid':'badge-active';
 const st=d.status==='OVERDUE'?t('statusOverdue'):d.status==='PAID'?t('statusPaid'):t('statusActive');
-return '<div class="debtor-card '+sc+'" style="animation-delay:'+(i*0.05)+'s"><div class="debtor-header"><div class="debtor-name">'+d.name+'</div><div class="debtor-amount">'+formatMoney(d.remaining_amount)+'</div></div><div class="debtor-info"><span><i class="fas fa-phone"></i>'+(d.phone||'-')+'</span><span><i class="fas fa-tag"></i>'+d.category+'</span>'+(d.due_date?'<span><i class="fas fa-calendar"></i>'+d.due_date+'</span>':'')+'</div><span class="debtor-badge '+bc+'">'+st+'</span><div class="debtor-details"><strong>'+t('total')+':</strong> '+formatMoney(d.total_amount)+' | <strong>'+t('paidAmount')+':</strong> '+formatMoney(d.paid_amount)+'</div><div class="debtor-actions">'+(d.status!=='PAID'?'<button class="btn-action btn-pay" onclick="openPayModal('+d.id+','+d.remaining_amount+')"><i class="fas fa-money-bill-wave"></i>'+t('pay')+'</button>':'')+'<button class="btn-action btn-delete" onclick="deleteDebtor('+d.id+')"><i class="fas fa-trash"></i>'+t('delete')+'</button></div></div>'}).join('');
+return '<div class="debtor-card '+sc+'" style="animation-delay:'+(i*0.05)+'s"><div class="debtor-header"><div class="debtor-name">'+d.name+'</div><div class="debtor-amount">'+formatMoney(d.remaining_amount)+'</div></div><div class="debtor-info"><span><i class="fas fa-phone"></i>'+(d.phone||'-')+'</span><span><i class="fas fa-tag"></i>'+d.category+'</span><span><i class="fas fa-id-badge"></i>#'+d.id+'</span>'+(d.due_date?'<span><i class="fas fa-calendar"></i>'+d.due_date+'</span>':'')+'</div><span class="debtor-badge '+bc+'">'+st+'</span><div class="debtor-details"><strong>'+t('total')+':</strong> '+formatMoney(d.total_amount)+' | <strong>'+t('paidAmount')+':</strong> '+formatMoney(d.paid_amount)+'</div><div class="debtor-actions">'+(d.status!=='PAID'?'<button class="btn-action btn-pay" onclick="openPayModal('+d.id+','+d.remaining_amount+')"><i class="fas fa-money-bill-wave"></i>'+t('pay')+'</button>':'')+'<button class="btn-action btn-delete" onclick="deleteDebtor('+d.id+')"><i class="fas fa-trash"></i>'+t('delete')+'</button></div></div>'}).join('');
 }catch(e){console.error(e);showToast('Xato: '+e.message,true)}
 }
 
@@ -483,18 +497,22 @@ else if(t==="muddat")txt="Assalomu alaykum, "+nm+"!\\n\\nQarz: "+db+" so'm.\\nKe
 else if(t==="rahmat")txt="Assalomu alaykum, "+nm+"!\\n\\nTo'lovingiz uchun katta rahmat!\\nQolgan qarz: "+db+" so'm.";
 document.getElementById('msg-text').value=txt;}
 
-function sendSMS(){
-let ph=document.getElementById('msg-phone').value.trim();
+async function sendSMS(){
+const debtorId=document.getElementById('msg-debtor').value;
 const txt=document.getElementById('msg-text').value.trim();
-if(!ph){alert("Telefon kiriting!");return}
+if(!debtorId){alert("Qarzdorni tanlang!");return}
 if(!txt){alert("Xabar yozing!");return}
-ph=ph.replace(/[^\d]/g,'');
-if(ph.startsWith('998'))ph=ph;else if(!ph.startsWith('998')&&ph.length===9)ph='998'+ph;
-navigator.clipboard.writeText(txt).then(()=>{
-const wa='https://wa.me/'+ph+'?text='+encodeURIComponent(txt);
-if(confirm("Xabar nusxalandi!\\n\\nWhatsApp orqali yuborilsinmi?\\n\\n(OK = WhatsApp, Bekor = Faqat nusxalash)")){
-window.open(wa,'_blank');}
-}).catch(()=>{alert("Xatoni qo'lda nusxalang")});}
+try{
+const r=await fetch('/api/send-message',{method:'POST',headers,body:JSON.stringify({debtor_id:parseInt(debtorId),message:txt})});
+if(r.ok){
+playSuccessSound();
+showToast("Xabar yuborildi!");
+document.getElementById('msg-text').value='';
+}else{
+const err=await r.json();
+showToast(err.detail||"Xato",true);
+}
+}catch(e){showToast("Xato: "+e.message,true)}}
 
 window.onload=()=>{
 const th=localStorage.getItem('theme')||'light';
@@ -572,6 +590,28 @@ async def delete_debtor(debtor_id: int, user: dict = Depends(get_current_user)):
         return {"ok": True}
 
 
+@app.post("/api/send-message")
+async def send_message(data: SendMessage, user: dict = Depends(get_current_user)):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT name, telegram_target FROM debtors WHERE id=? AND user_id=?", 
+                               (data.debtor_id, user["telegram_id"]))
+        row = await cur.fetchone()
+    
+    if not row:
+        raise HTTPException(404, "Qarzdor topilmadi")
+    if not row["telegram_target"]:
+        raise HTTPException(400, "Qarzdor hali botga bog'lanmagan. Qarzdor botga /link <ID> yozishi kerak.")
+    
+    try:
+        await bot.send_message(row["telegram_target"], 
+                              f"💌 <b>Xabar keldi:</b>\n\n{data.message}\n\n— {user['first_name']}", 
+                              parse_mode="HTML")
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 @app.get("/api/export/csv")
 async def export_csv(user: dict = Depends(get_current_user)):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -596,15 +636,40 @@ async def webhook(request: Request):
 async def cmd_start(m: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📒 Ilovani ochish", web_app=WebAppInfo(url=WEBAPP_URL))]])
+    uid = m.from_user.id
     await m.answer(
-        "<b>💎 Qarz Daftar Pro</b>\n\n"
-        "✨ Premium dizayn\n"
-        "🎵 Tovush + 🎊 Confetti\n"
-        "📊 Grafiklar va statistika\n"
-        "📄 Hisobotlar (UZ/RU/EN)\n"
-        "🌍 3 til qo'llab-quvvatlanadi\n\n"
-        "Tugmani bosing 👇",
+        f"<b>💎 Qarz Daftar Pro</b>\n\n"
+        f"Sizning ID: <code>{uid}</code>\n\n"
+        f"📩 <b>Xabar olish uchun:</b>\n"
+        f"Qarz beruvchi sizni ilovaga qo'shgach, sizga <b>Debtor ID</b> beradi.\n"
+        f"Shu ID bilan: <code>/link ID</code> yuboring\n\n"
+        f"✨ Premium dizayn | 🎊 Confetti\n"
+        f"📊 Statistika | 📄 Hisobotlar\n"
+        f"🌍 3 til (UZ/RU/EN)\n\n"
+        f"Tugmani bosing 👇",
         reply_markup=kb)
+
+
+@dp.message(Command("link"))
+async def cmd_link(m: types.Message):
+    args = m.text.split()
+    if len(args) < 2:
+        await m.answer("❌ /link <debtor_id>\n\nDebtor ID ni ilovada ko'rasiz (kartada #raqam)")
+        return
+    try:
+        debtor_id = int(args[1])
+        uid = m.from_user.id
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("UPDATE debtors SET telegram_target=? WHERE id=?", (uid, debtor_id))
+            await db.commit()
+            if cur.rowcount == 0:
+                await m.answer("❌ Bu ID topilmadi yoki sizga tegishli emas")
+                return
+        await m.answer(f"✅ Bog'landi! Endi sizga ilovadan xabar yuborish mumkin.\n\nDebtor ID: {debtor_id}")
+    except ValueError:
+        await m.answer("❌ ID raqam bo'lishi kerak")
+    except Exception as e:
+        await m.answer(f"❌ Xato: {e}")
 
 
 @dp.message(Command("report"))
