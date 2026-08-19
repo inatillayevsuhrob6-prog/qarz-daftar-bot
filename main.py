@@ -294,7 +294,37 @@ body::before{content:'';position:fixed;top:-50%;left:-50%;width:200%;height:200%
 <div class="nav-bottom">
 <button class="nav-item active" onclick="switchPage('home',this)"><i class="fas fa-home"></i><span data-i18n="navHome">Bosh</span></button>
 <button class="nav-item" onclick="switchPage('stats',this)"><i class="fas fa-chart-pie"></i><span data-i18n="navStats">Stat</span></button>
+<button class="nav-item" onclick="switchPage('msg',this)"><i class="fas fa-paper-plane"></i><span>Xabar</span></button>
 <button class="nav-item" onclick="switchPage('report',this)"><i class="fas fa-file-alt"></i><span data-i18n="navReport">Hisobot</span></button>
+</div>
+
+<div id="page-msg" class="page">
+<div class="section-title"><i class="fas fa-paper-plane"></i><span>Xabar yuborish</span></div>
+<div style="background:var(--card-bg);padding:16px;border-radius:16px;margin-bottom:16px;font-size:13px;color:var(--text-light)">
+Qarzdorni tanlang, xabar yozing va <b>Yuborish</b> tugmasini bosing. Telefon SMS ilovasi ochiladi.
+</div>
+<div class="form-group">
+<label class="form-label">👤 Qarzdorni tanlang</label>
+<select class="form-input" id="msg-debtor" onchange="selectDebtor()">
+<option value="">-- Tanlang --</option>
+</select>
+</div>
+<div class="form-group">
+<label class="form-label">📱 Telefon</label>
+<input type="tel" class="form-input" id="msg-phone" placeholder="+998901234567">
+</div>
+<div class="form-group">
+<label class="form-label">💬 Xabar matni</label>
+<textarea class="form-input" id="msg-text" rows="5" placeholder="Xabar yozing..."></textarea>
+</div>
+<div style="font-size:13px;font-weight:700;margin-bottom:10px">💡 Tayyor xabarlar</div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:16px">
+<button class="btn-submit" style="background:#6b7280;padding:12px;font-size:13px" onclick="template('eslatma')">💳 Qarz eslatmasi</button>
+<button class="btn-submit" style="background:#6b7280;padding:12px;font-size:13px" onclick="template('muloyim')">🤝 Muloyim</button>
+<button class="btn-submit" style="background:#6b7280;padding:12px;font-size:13px" onclick="template('muddat')">📅 Muddat</button>
+<button class="btn-submit" style="background:#6b7280;padding:12px;font-size:13px" onclick="template('rahmat')">🙏 Rahmat</button>
+</div>
+<button class="btn-submit" style="background:linear-gradient(135deg,#10b981,#059669)" onclick="sendSms()">📤 Xabar yuborish (SMS)</button>
 </div>
 
 <div id="addModal" class="modal-overlay"><div class="modal-content">
@@ -340,7 +370,7 @@ function t(k){return translations[currentLang][k]||k}
 function updateTranslations(){document.querySelectorAll('[data-i18n]').forEach(el=>{el.textContent=t(el.getAttribute('data-i18n'))})}
 function toggleLang(){playClickSound();const L=['uz','ru','en'];currentLang=L[(L.indexOf(currentLang)+1)%3];localStorage.setItem('lang',currentLang);updateTranslations();loadData();showToast('🌐 '+currentLang.toUpperCase())}
 function setReportLang(l,btn){playClickSound();reportLang=l;document.querySelectorAll('.lang-btn').forEach(b=>b.classList.remove('active'));btn.classList.add('active');generateReport()}
-function switchPage(p,btn){playClickSound();document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'));document.getElementById('page-'+p).classList.add('active');document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));btn.classList.add('active');if(p==='stats')loadCharts();if(p==='report')generateReport()}
+function switchPage(p,btn){playClickSound();document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'));document.getElementById('page-'+p).classList.add('active');document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));btn.classList.add('active');if(p==='stats')loadCharts();if(p==='report')generateReport();if(p==='msg')loadDebtorsForMsg()}
 
 function playSuccessSound(){try{const c=new (window.AudioContext||window.webkitAudioContext)();const o=c.createOscillator();const g=c.createGain();o.connect(g);g.connect(c.destination);o.frequency.setValueAtTime(523.25,c.currentTime);o.frequency.setValueAtTime(659.25,c.currentTime+0.1);o.frequency.setValueAtTime(783.99,c.currentTime+0.2);g.gain.setValueAtTime(0.3,c.currentTime);g.gain.exponentialRampToValueAtTime(0.01,c.currentTime+0.5);o.start(c.currentTime);o.stop(c.currentTime+0.5)}catch(e){}}
 function playClickSound(){try{const c=new (window.AudioContext||window.webkitAudioContext)();const o=c.createOscillator();const g=c.createGain();o.connect(g);g.connect(c.destination);o.frequency.setValueAtTime(800,c.currentTime);g.gain.setValueAtTime(0.2,c.currentTime);g.gain.exponentialRampToValueAtTime(0.01,c.currentTime+0.1);o.start(c.currentTime);o.stop(c.currentTime+0.1)}catch(e){}}
@@ -430,6 +460,74 @@ const r=await fetch('/api/debtors/'+id,{method:'DELETE',headers});
 if(!r.ok)throw new Error('Del error');
 playClickSound();showToast(t('deleted'));loadData();
 }catch(e){showToast('Xato: '+e.message,true)}
+}
+
+
+let debtorsList=[];
+
+async function loadDebtorsForMsg(){
+try{
+debtorsList=await(await fetch('/api/debtors',{headers})).json();
+const sel=document.getElementById('msg-debtor');
+sel.innerHTML='<option value="">-- Tanlang --</option>';
+debtorsList.forEach(d=>{
+if(d.phone){
+const opt=document.createElement('option');
+opt.value=d.id;
+opt.textContent=d.name+' — '+d.phone;
+opt.dataset.phone=d.phone;
+opt.dataset.name=d.name;
+opt.dataset.debt=d.remaining_amount;
+sel.appendChild(opt);
+}});
+}catch(e){console.error(e)}
+}
+
+function selectDebtor(){
+const sel=document.getElementById('msg-debtor');
+const opt=sel.options[sel.selectedIndex];
+if(!opt||!opt.value){
+document.getElementById('msg-phone').value='';
+document.getElementById('msg-text').value='';
+return;
+}
+const phone=opt.dataset.phone||'';
+const name=opt.dataset.name||'';
+const debt=Number(opt.dataset.debt||0).toLocaleString('uz-UZ');
+document.getElementById('msg-phone').value=phone;
+document.getElementById('msg-text').value=
+'Assalomu alaykum, '+name+'!\n\n'+
+'Sizdagi qolgan qarz: '+debt+" so'm.\n"+
+'Iltimos, imkon bo\\'lsa to\\'lovni amalga oshiring.\n\nRahmat!';
+}
+
+function template(type){
+const sel=document.getElementById('msg-debtor');
+const opt=sel.options[sel.selectedIndex];
+if(!opt||!opt.value){alert('Avval qarzdorni tanlang!');return}
+const name=opt.dataset.name||'';
+const debt=Number(opt.dataset.debt||0).toLocaleString('uz-UZ');
+let text='';
+if(type==='eslatma'){
+text='Assalomu alaykum, '+name+'!\n\nSizdagi qolgan qarz: '+debt+" so'm.\nIltimos, imkon bo\\'lsa to\\'lovni amalga oshiring.\n\nRahmat!";
+}else if(type==='muloyim'){
+text='Assalomu alaykum, '+name+'! 😊\n\nQarz bo\\'yicha kichik eslatma: '+debt+" so'm.\nQulay vaqtingizda to\\'lovni amalga oshirsangiz, xursand bo\\'lamiz.\n\nRahmat!";
+}else if(type==='muddat'){
+text='Assalomu alaykum, '+name+'!\n\nQarz bo\\'yicha eslatma: '+debt+" so'm.\nIltimos, kelishilgan muddatda to\\'lovni amalga oshiring.\n\nRahmat!";
+}else if(type==='rahmat'){
+text='Assalomu alaykum, '+name+'!\n\nTo\\'lovingiz uchun katta rahmat! 🙏\nQolgan qarz: '+debt+" so'm.";
+}
+document.getElementById('msg-text').value=text;
+}
+
+function sendSms(){
+let phone=document.getElementById('msg-phone').value.trim();
+const text=document.getElementById('msg-text').value.trim();
+if(!phone){alert('Telefon raqamini kiriting!');return}
+if(!text){alert('Xabar matnini yozing!');return}
+phone=phone.replace(/[^\d+]/g,'');
+const smsUrl='sms:'+phone+'?body='+encodeURIComponent(text);
+window.location.href=smsUrl;
 }
 
 window.onload=()=>{
