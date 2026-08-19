@@ -640,10 +640,10 @@ async def cmd_start(m: types.Message):
     await m.answer(
         f"<b>💎 Qarz Daftar Pro</b>\n\n"
         f"Sizning ID: <code>{uid}</code>\n\n"
-        f"📩 <b>Xabar olish uchun:</b>\n"
-        f"Qarz beruvchi sizni ilovaga qo'shgach, sizga <b>Debtor ID</b> beradi.\n"
-        f"Shu ID bilan: <code>/link ID</code> yuboring\n\n"
-        f"✨ Premium dizayn | 🎊 Confetti\n"
+        # f"📩 <b>Xabar olish uchun:</b>\n"
+        # f"Qarz beruvchi sizni ilovaga qo'shgach, sizga <b>Debtor ID</b> beradi.\n"
+        # f"Shu ID bilan: <code>/link ID</code> yuboring\n\n"
+        # f"✨ Premium dizayn | 🎊 Confetti\n"
         f"📊 Statistika | 📄 Hisobotlar\n"
         f"🌍 3 til (UZ/RU/EN)\n\n"
         f"Tugmani bosing 👇",
