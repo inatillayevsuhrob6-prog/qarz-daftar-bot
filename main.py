@@ -311,8 +311,8 @@ body::before{content:'';position:fixed;top:-50%;left:-50%;width:200%;height:200%
 <button class="btn-submit" style="background:#6b7280;padding:12px;font-size:13px" onclick="tpl('muddat')">📅 Muddat</button>
 <button class="btn-submit" style="background:#6b7280;padding:12px;font-size:13px" onclick="tpl('rahmat')">🙏 Rahmat</button>
 </div>
-<button class="btn-submit" style="background:linear-gradient(135deg,#10b981,#059669)" onclick="sendSMS()">📤 SMS yuborish</button>
-<div style="font-size:11px;color:var(--text-light);text-align:center;margin-top:10px">Telefon SMS ilovasi ochiladi</div>
+<button class="btn-submit" style="background:linear-gradient(135deg,#10b981,#059669)" onclick="sendSMS()">📤 Yuborish (WhatsApp)</button>
+<div style="font-size:11px;color:var(--text-light);text-align:center;margin-top:10px">Xabar nusxalanadi va WhatsApp ochiladi</div>
 </div>
 
 <div id="addModal" class="modal-overlay"><div class="modal-content">
@@ -488,8 +488,13 @@ let ph=document.getElementById('msg-phone').value.trim();
 const txt=document.getElementById('msg-text').value.trim();
 if(!ph){alert("Telefon kiriting!");return}
 if(!txt){alert("Xabar yozing!");return}
-ph=ph.replace(/[^\d+]/g,'');
-window.location.href="sms:"+ph+"?body="+encodeURIComponent(txt);}
+ph=ph.replace(/[^\d]/g,'');
+if(ph.startsWith('998'))ph=ph;else if(!ph.startsWith('998')&&ph.length===9)ph='998'+ph;
+navigator.clipboard.writeText(txt).then(()=>{
+const wa='https://wa.me/'+ph+'?text='+encodeURIComponent(txt);
+if(confirm("Xabar nusxalandi!\\n\\nWhatsApp orqali yuborilsinmi?\\n\\n(OK = WhatsApp, Bekor = Faqat nusxalash)")){
+window.open(wa,'_blank');}
+}).catch(()=>{alert("Xatoni qo'lda nusxalang")});}
 
 window.onload=()=>{
 const th=localStorage.getItem('theme')||'light';
