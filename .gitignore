@@ -1,3 +1,6 @@
 venv/
 __pycache__/
 *.pyc
+
+qarz_daftar.db
+main_before_*.py
