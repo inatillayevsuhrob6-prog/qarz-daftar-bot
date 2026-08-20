@@ -334,7 +334,7 @@ body::before{content:'';position:fixed;top:-50%;left:-50%;width:200%;height:200%
 <button class="btn-submit" style="background:#6b7280;padding:12px;font-size:13px" onclick="tpl('muddat')">📅 Muddat</button>
 <button class="btn-submit" style="background:#6b7280;padding:12px;font-size:13px" onclick="tpl('rahmat')">🙏 Rahmat</button>
 </div>
-<button class="btn-submit" style="background:linear-gradient(135deg,#10b981,#059669)" onclick="sendSMS()">📤 Telegram orqali yuborish</button>
+<button class="btn-submit" style="background:linear-gradient(135deg,#10b981,#059669)" onclick="sendSMS()">📤 Yuborish (Telegram / WhatsApp)</button>
 <button class="btn-submit" style="background:linear-gradient(135deg,#3b82f6,#2563eb);margin-top:10px" onclick="copyLink()">🔗 Bog'lanish linkini nusxalash</button>
 <div style="font-size:11px;color:var(--text-light);text-align:center;margin-top:10px">Qarzdor link'ni bosganda avtomatik bog'lanadi</div>
 </div>
@@ -510,15 +510,30 @@ document.getElementById('msg-text').value=txt;}
 async function sendSMS(){
 const debtorId=document.getElementById('msg-debtor').value;
 const txt=document.getElementById('msg-text').value.trim();
+const ph=document.getElementById('msg-phone').value.trim();
 if(!debtorId){alert("Qarzdorni tanlang!");return}
 if(!txt){alert("Xabar yozing!");return}
+let tgOk=false;
 try{
 const r=await fetch('/api/send-message',{method:'POST',headers,body:JSON.stringify({debtor_id:parseInt(debtorId),message:txt})});
-if(r.ok){
+if(r.ok){tgOk=true}
+}catch(e){}
+if(tgOk){
 playSuccessSound();
-showToast("Xabar yuborildi!");
+showToast("Xabar Telegram orqali yuborildi!");
 document.getElementById('msg-text').value='';
+return;
+}
+if(ph){
+let p=ph.replace(/[^0-9]/g,'');
+if(p.length===9)p='998'+p;
+window.open('https://wa.me/'+p+'?text='+encodeURIComponent(txt),'_blank');
+showToast("WhatsApp ochildi - Yuborish ni bosing");
 }else{
+const link='https://t.me/qarz_daftar_bot?start=debtor_'+debtorId;
+navigator.clipboard.writeText(link);
+showToast("Bog'lanish linki nusxalandi!",true);
+}}else{
 const err=await r.json();
 showToast(err.detail||"Xato",true);
 }
