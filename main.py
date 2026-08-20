@@ -537,39 +537,199 @@ playClickSound();showToast(t('deleted'));loadData();
 }
 
 let msgDebtors=[];
+
 async function loadMsgDebtors(){
-try{
-msgDebtors=await(await fetch('/api/debtors',{headers})).json();
-const sel=document.getElementById('msg-debtor');
-sel.innerHTML='<option value="">-- Tanlang --</option>';
-msgDebtors.filter(d=>d.phone).forEach(d=>{
-const o=document.createElement('option');
-o.value=d.id;o.textContent=d.name+' - '+d.phone;
-o.dataset.phone=d.phone;o.dataset.name=d.name;o.dataset.debt=d.remaining_amount;
-sel.appendChild(o);});
-}catch(e){console.error(e)}}
+    try{
+        const r=await fetch('/api/debtors',{headers});
+        if(!r.ok) throw new Error("Qarzdorlarni olishda xato");
+
+        msgDebtors=await r.json();
+
+        const sel=document.getElementById('msg-debtor');
+        if(!sel) return;
+
+        sel.innerHTML='<option value="">-- Tanlang --</option>';
+
+        msgDebtors.forEach(d=>{
+            const o=document.createElement('option');
+            o.value=d.id;
+            o.textContent=d.name+' — '+formatMoney(d.remaining_amount);
+
+            o.dataset.name=d.name;
+            o.dataset.debt=d.remaining_amount;
+
+            sel.appendChild(o);
+        });
+    }catch(e){
+        console.error("loadMsgDebtors:",e);
+        showToast("Qarzdorlarni yuklashda xato",true);
+    }
+}
 
 function selDebtor(){
-const sel=document.getElementById('msg-debtor');
-const opt=sel.options[sel.selectedIndex];
-if(!opt||!opt.value){document.getElementById('msg-phone').value='';document.getElementById('msg-text').value='';return}
-const ph=opt.dataset.phone,nm=opt.dataset.name,db=Number(opt.dataset.debt||0).toLocaleString('uz-UZ');
-document.getElementById('msg-phone').value=ph;
-document.getElementById('msg-text').value="Assalomu alaykum, "+nm+"!\\n\\nSizdagi qolgan qarz: "+db+" so'm.\\nIltimos, imkon bo'lsa to'lovni amalga oshiring.\\n\\nRahmat!";}
+    const sel=document.getElementById('msg-debtor');
+    const text=document.getElementById('msg-text');
 
-function tpl(t){
-const sel=document.getElementById('msg-debtor');
-const opt=sel.options[sel.selectedIndex];
-if(!opt||!opt.value){alert("Avval qarzdorni tanlang!");return}
-const nm=opt.dataset.name,db=Number(opt.dataset.debt||0).toLocaleString('uz-UZ');
-let txt="";
-if(t==="eslatma")txt="Assalomu alaykum, "+nm+"!\\n\\nSizdagi qolgan qarz: "+db+" so'm.\\nIltimos, imkon bo'lsa to'lovni amalga oshiring.\\n\\nRahmat!";
-else if(t==="muloyim")txt="Assalomu alaykum, "+nm+"!\\n\\nQarz bo'yicha kichik eslatma: "+db+" so'm.\\nQulay vaqtingizda to'lasangiz xursand bo'lamiz.\\n\\nRahmat!";
-else if(t==="muddat")txt="Assalomu alaykum, "+nm+"!\\n\\nQarz: "+db+" so'm.\\nKelishilgan muddatda to'lovni amalga oshiring.\\n\\nRahmat!";
-else if(t==="rahmat")txt="Assalomu alaykum, "+nm+"!\\n\\nTo'lovingiz uchun katta rahmat!\\nQolgan qarz: "+db+" so'm.";
-document.getElementById('msg-text').value=txt;}
+    if(!sel || !text) return;
 
-).catch(()=>{alert("Xatoni qo'lda nusxalang")});}
+    const opt=sel.options[sel.selectedIndex];
+
+    if(!opt || !opt.value){
+        text.value='';
+        return;
+    }
+
+    const nm=opt.dataset.name || '';
+    const db=Number(opt.dataset.debt || 0).toLocaleString('uz-UZ');
+
+    text.value=
+        "Assalomu alaykum, "+nm+"!\n\n"+
+        "Sizdagi qolgan qarz: "+db+" so'm.\n"+
+        "Iltimos, imkon bo'lsa to'lovni amalga oshiring.\n\n"+
+        "Rahmat!";
+}
+
+function tpl(type){
+    const sel=document.getElementById('msg-debtor');
+    const text=document.getElementById('msg-text');
+
+    if(!sel || !text) return;
+
+    const opt=sel.options[sel.selectedIndex];
+
+    if(!opt || !opt.value){
+        showToast("Avval qarzdorni tanlang!",true);
+        return;
+    }
+
+    const nm=opt.dataset.name || '';
+    const db=Number(opt.dataset.debt || 0).toLocaleString('uz-UZ');
+
+    let txt='';
+
+    if(type==="eslatma"){
+        txt=
+            "Assalomu alaykum, "+nm+"!\n\n"+
+            "Sizdagi qolgan qarz: "+db+" so'm.\n"+
+            "Iltimos, imkon bo'lsa to'lovni amalga oshiring.\n\n"+
+            "Rahmat!";
+    }
+
+    if(type==="muloyim"){
+        txt=
+            "Assalomu alaykum, "+nm+"!\n\n"+
+            "Qarz bo'yicha kichik eslatma: "+db+" so'm.\n"+
+            "Qulay vaqtingizda to'lasangiz xursand bo'lamiz.\n\n"+
+            "Rahmat!";
+    }
+
+    if(type==="muddat"){
+        txt=
+            "Assalomu alaykum, "+nm+"!\n\n"+
+            "Qarz: "+db+" so'm.\n"+
+            "Kelishilgan muddatda to'lovni amalga oshiring.\n\n"+
+            "Rahmat!";
+    }
+
+    if(type==="rahmat"){
+        txt=
+            "Assalomu alaykum, "+nm+"!\n\n"+
+            "To'lovingiz uchun katta rahmat!\n"+
+            "Qolgan qarz: "+db+" so'm.";
+    }
+
+    text.value=txt;
+}
+
+async function saveTelegramId(){
+    const sel=document.getElementById('msg-debtor');
+    const input=document.getElementById('msg-telegram-id');
+
+    if(!sel || !input) return;
+
+    const debtorId=sel.value;
+    const telegramId=input.value.trim();
+
+    if(!debtorId){
+        showToast("Avval qarzdorni tanlang!",true);
+        return;
+    }
+
+    if(!telegramId || !/^[0-9]+$/.test(telegramId)){
+        showToast("Telegram ID noto'g'ri!",true);
+        return;
+    }
+
+    try{
+        const r=await fetch(
+            '/api/debtors/'+debtorId+'/telegram',
+            {
+                method:'PUT',
+                headers:headers,
+                body:JSON.stringify({
+                    telegram_target:Number(telegramId)
+                })
+            }
+        );
+
+        const data=await r.json();
+
+        if(!r.ok){
+            throw new Error(data.detail || "Telegram ID saqlanmadi");
+        }
+
+        showToast("✅ Telegram ID saqlandi!");
+    }catch(e){
+        console.error("saveTelegramId:",e);
+        showToast("❌ "+e.message,true);
+    }
+}
+
+async function sendTelegram(){
+    const sel=document.getElementById('msg-debtor');
+    const text=document.getElementById('msg-text');
+
+    if(!sel || !text) return;
+
+    const debtorId=sel.value;
+    const message=text.value.trim();
+
+    if(!debtorId){
+        showToast("Avval qarzdorni tanlang!",true);
+        return;
+    }
+
+    if(!message){
+        showToast("Xabar matnini yozing!",true);
+        return;
+    }
+
+    try{
+        const r=await fetch(
+            '/api/send-message',
+            {
+                method:'POST',
+                headers:headers,
+                body:JSON.stringify({
+                    debtor_id:Number(debtorId),
+                    message:message
+                })
+            }
+        );
+
+        const data=await r.json();
+
+        if(!r.ok){
+            throw new Error(data.detail || "Telegram xabar yuborilmadi");
+        }
+
+        playSuccessSound();
+        showToast("📤 Telegram orqali yuborildi!");
+    }catch(e){
+        console.error("sendTelegram:",e);
+        showToast("❌ "+e.message,true);
+    }
+}
 
 window.onload=()=>{
 const th=localStorage.getItem('theme')||'light';
