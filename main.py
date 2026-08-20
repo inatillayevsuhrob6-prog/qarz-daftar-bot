@@ -52,6 +52,10 @@ class SendMessage(BaseModel):
     message: str
 
 
+class TelegramTargetUpdate(BaseModel):
+    telegram_target: int
+
+
 # ============ DATABASE ============
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
@@ -308,20 +312,93 @@ body::before{content:'';position:fixed;top:-50%;left:-50%;width:200%;height:200%
 </div>
 
 <div id="page-msg" class="page">
-<div class="section-title"><i class="fas fa-paper-plane"></i><span>Xabar yuborish</span></div>
-<div style="background:var(--card-bg);padding:16px;border-radius:16px;margin-bottom:16px;font-size:13px;color:var(--text-light)">Qarzdorni tanlang, xabar yozing va SMS ilovasi orqali yuboring</div>
-<div class="form-group"><label class="form-label">👤 Qarzdor</label><select class="form-input" id="msg-debtor" onchange="selDebtor()"><option value="">-- Tanlang --</option></select></div>
-<div class="form-group"><label class="form-label">📱 Telefon</label><input type="tel" class="form-input" id="msg-phone" placeholder="+998..."></div>
-<div class="form-group"><label class="form-label">💬 Xabar matni</label><textarea class="form-input" id="msg-text" rows="6" placeholder="Xabar yozing..."></textarea></div>
-<div style="font-size:13px;font-weight:700;margin-bottom:10px">💡 Tayyor shablonlar</div>
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:16px">
-<button class="btn-submit" style="background:#6b7280;padding:12px;font-size:13px" onclick="tpl('eslatma')">💳 Qarz eslatmasi</button>
-<button class="btn-submit" style="background:#6b7280;padding:12px;font-size:13px" onclick="tpl('muloyim')">🤝 Muloyim</button>
-<button class="btn-submit" style="background:#6b7280;padding:12px;font-size:13px" onclick="tpl('muddat')">📅 Muddat</button>
-<button class="btn-submit" style="background:#6b7280;padding:12px;font-size:13px" onclick="tpl('rahmat')">🙏 Rahmat</button>
-</div>
-<button class="btn-submit" style="background:linear-gradient(135deg,#10b981,#059669)" onclick="sendSMS()">📤 Yuborish (WhatsApp)</button>
-<div style="font-size:11px;color:var(--text-light);text-align:center;margin-top:10px">Xabar nusxalanadi va WhatsApp ochiladi</div>
+ <div class="section-title">
+   <i class="fas fa-paper-plane"></i>
+   <span>Telegram xabar yuborish</span>
+ </div>
+
+ <div style="background:var(--card-bg);padding:16px;border-radius:16px;margin-bottom:16px;font-size:13px;color:var(--text-light)">
+   📲 Qarzdor Telegram botga kirib <b>/id</b> yozadi.
+   Keyin olingan Telegram ID ni shu yerga saqlaysiz.
+ </div>
+
+ <div class="form-group">
+   <label class="form-label">👤 Qarzdor</label>
+   <select class="form-input" id="msg-debtor" onchange="selDebtor()">
+     <option value="">-- Tanlang --</option>
+   </select>
+ </div>
+
+ <div class="form-group">
+   <label class="form-label">🆔 Telegram ID</label>
+   <input
+     type="text"
+     class="form-input"
+     id="msg-telegram-id"
+     placeholder="Masalan: 123456789"
+   >
+ </div>
+
+ <button
+   class="btn-submit"
+   style="background:#667eea;margin-bottom:16px"
+   onclick="saveTelegramId()">
+   💾 Telegram ID ni saqlash
+ </button>
+
+ <div class="form-group">
+   <label class="form-label">💬 Xabar matni</label>
+   <textarea
+     class="form-input"
+     id="msg-text"
+     rows="6"
+     placeholder="Xabar yozing..."></textarea>
+ </div>
+
+ <div style="font-size:13px;font-weight:700;margin-bottom:10px">
+   💡 Tayyor shablonlar
+ </div>
+
+ <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:16px">
+   <button
+     class="btn-submit"
+     style="background:#6b7280;padding:12px;font-size:13px"
+     onclick="tpl('eslatma')">
+     💳 Qarz eslatmasi
+   </button>
+
+   <button
+     class="btn-submit"
+     style="background:#6b7280;padding:12px;font-size:13px"
+     onclick="tpl('muloyim')">
+     🤝 Muloyim
+   </button>
+
+   <button
+     class="btn-submit"
+     style="background:#6b7280;padding:12px;font-size:13px"
+     onclick="tpl('muddat')">
+     📅 Muddat
+   </button>
+
+   <button
+     class="btn-submit"
+     style="background:#6b7280;padding:12px;font-size:13px"
+     onclick="tpl('rahmat')">
+     🙏 Rahmat
+   </button>
+ </div>
+
+ <button
+   class="btn-submit"
+   style="background:linear-gradient(135deg,#229ED9,#0088cc)"
+   onclick="sendTelegram()">
+   📤 Telegram orqali yuborish
+ </button>
+
+ <div style="font-size:11px;color:var(--text-light);text-align:center;margin-top:10px">
+   Xabar to'g'ridan-to'g'ri Telegram bot orqali yuboriladi
+ </div>
 </div>
 
 <div id="addModal" class="modal-overlay"><div class="modal-content">
@@ -492,18 +569,7 @@ else if(t==="muddat")txt="Assalomu alaykum, "+nm+"!\\n\\nQarz: "+db+" so'm.\\nKe
 else if(t==="rahmat")txt="Assalomu alaykum, "+nm+"!\\n\\nTo'lovingiz uchun katta rahmat!\\nQolgan qarz: "+db+" so'm.";
 document.getElementById('msg-text').value=txt;}
 
-function sendSMS(){
-let ph=document.getElementById('msg-phone').value.trim();
-const txt=document.getElementById('msg-text').value.trim();
-if(!ph){alert("Telefon kiriting!");return}
-if(!txt){alert("Xabar yozing!");return}
-ph=ph.replace(/[^\d]/g,'');
-if(ph.startsWith('998'))ph=ph;else if(!ph.startsWith('998')&&ph.length===9)ph='998'+ph;
-navigator.clipboard.writeText(txt).then(()=>{
-const wa='https://wa.me/'+ph+'?text='+encodeURIComponent(txt);
-if(confirm("Xabar nusxalandi!\\n\\nWhatsApp orqali yuborilsinmi?\\n\\n(OK = WhatsApp, Bekor = Faqat nusxalash)")){
-window.open(wa,'_blank');}
-}).catch(()=>{alert("Xatoni qo'lda nusxalang")});}
+).catch(()=>{alert("Xatoni qo'lda nusxalang")});}
 
 window.onload=()=>{
 const th=localStorage.getItem('theme')||'light';
@@ -581,6 +647,41 @@ async def delete_debtor(debtor_id: int, user: dict = Depends(get_current_user)):
         return {"ok": True}
 
 
+@app.put("/api/debtors/{debtor_id}/telegram")
+async def update_telegram_target(
+    debtor_id: int,
+    data: TelegramTargetUpdate,
+    user: dict = Depends(get_current_user)
+):
+    async with aiosqlite.connect(DB_PATH) as db:
+
+        cur = await db.execute(
+            "SELECT id FROM debtors WHERE id=? AND user_id=?",
+            (debtor_id, user["telegram_id"])
+        )
+
+        row = await cur.fetchone()
+
+        if not row:
+            raise HTTPException(404, "Qarzdor topilmadi")
+
+        await db.execute(
+            "UPDATE debtors SET telegram_target=? WHERE id=? AND user_id=?",
+            (
+                data.telegram_target,
+                debtor_id,
+                user["telegram_id"]
+            )
+        )
+
+        await db.commit()
+
+    return {
+        "ok": True,
+        "telegram_target": data.telegram_target
+    }
+
+
 @app.post("/api/send-message")
 async def send_message(data: SendMessage, user: dict = Depends(get_current_user)):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -623,6 +724,17 @@ async def webhook(request: Request):
 
 
 # ============ BOT ============
+@dp.message(Command("id"))
+async def cmd_id(m: types.Message):
+
+    await m.answer(
+        "🆔 <b>Sizning Telegram ID:</b>\n\n"
+        f"<code>{m.from_user.id}</code>\n\n"
+        "Shu raqamni Qarz Daftar ilovasidagi "
+        "Telegram ID maydoniga kiriting."
+    )
+
+
 @dp.message(CommandStart())
 async def cmd_start(m: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -634,6 +746,7 @@ async def cmd_start(m: types.Message):
         "📊 Grafiklar va statistika\n"
         "📄 Hisobotlar (UZ/RU/EN)\n"
         "🌍 3 til qo'llab-quvvatlanadi\n\n"
+        "🆔 Telegram ID olish uchun /id yozing\n\n"
         "Tugmani bosing 👇",
         reply_markup=kb)
 
